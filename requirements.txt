@@ -1,0 +1,23 @@
+# ===== Microsoft Agent Framework =====
+agent-framework-azure-ai==1.0.0rc2
+agent-framework-core==1.0.0rc2
+
+# ===== Azure AI Projects SDK =====
+azure-ai-projects==2.0.0b3
+azure-identity>=1.25.2
+
+# ===== Data & Utils =====
+pydantic>=2.7,<3.0
+python-dotenv>=1.0.0
+pyyaml>=6.0
+
+# ===== Azure Retail Prices API + Excel =====
+aiohttp>=3.9
+openpyxl>=3.1
+
+# ===== Diagram Rendering (local) =====
+diagrams>=0.25.1
+
+# ===== Testing =====
+pytest>=8.0
+pytest-asyncio>=0.23

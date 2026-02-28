@@ -1,0 +1,118 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "🧪 Pytest (Mock Mode)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "tests/test_workflow.py",
+                "-v",
+                "--tb=short",
+                "-s"
+            ],
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src",
+                "MOCK_MODE": "true",
+                "RUN_MODE": "cli",
+                "OUTPUT_DIR": "${workspaceFolder}/out"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "🟡 CLI — Mock Mode",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "orchestrator_app.main",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src",
+                "MOCK_MODE": "true",
+                "RUN_MODE": "cli",
+                "OUTPUT_DIR": "${workspaceFolder}/out"
+            },
+            "args": [
+                "我需要一個 Azure 環境，包含 App Service + VNet + Subnet，部署在 eastasia，環境數量 2 (dev + prod)，幣別 TWD"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "🟢 CLI — Real Foundry",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "orchestrator_app.main",
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src",
+                "MOCK_MODE": "false",
+                "RUN_MODE": "cli",
+                "OUTPUT_DIR": "${workspaceFolder}/out"
+            },
+            "args": [
+                "我需要一個 Azure 環境，包含 App Service + VNet + Subnet，部署在 eastasia，環境數量 2 (dev + prod)，幣別 TWD"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "🌐 HTTP Server — Mock Mode (port 8088)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "orchestrator_app.main",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src",
+                "MOCK_MODE": "true",
+                "RUN_MODE": "server",
+                "OUTPUT_DIR": "${workspaceFolder}/out"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "🌐 HTTP Server — Real Foundry (port 8088)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "orchestrator_app.main",
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src",
+                "MOCK_MODE": "false",
+                "RUN_MODE": "server",
+                "OUTPUT_DIR": "${workspaceFolder}/out"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "🔬 Pytest — Real Foundry (SLOW)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "tests/",
+                "-v",
+                "--tb=long",
+                "-s",
+                "-k",
+                "real or foundry"
+            ],
+            "envFile": "${workspaceFolder}/.env",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src",
+                "MOCK_MODE": "false",
+                "RUN_MODE": "cli",
+                "OUTPUT_DIR": "${workspaceFolder}/out"
+            },
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
