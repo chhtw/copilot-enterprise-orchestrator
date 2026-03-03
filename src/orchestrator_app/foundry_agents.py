@@ -17,10 +17,14 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+import yaml
 from azure.identity.aio import DefaultAzureCredential
 from azure.ai.projects.aio import AIProjectClient
+
+from opentelemetry import trace as _otel_trace
 
 from .contracts import (
     CostLineItem,
@@ -33,6 +37,9 @@ from .contracts import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── OTel tracer ──
+_tracer = _otel_trace.get_tracer("ccoe-orchestrator.foundry_agents")
 
 # ---------------------------------------------------------------------------
 # 設定
@@ -63,6 +70,16 @@ COST_BROWSER_TIMEOUT = float(os.getenv("COST_BROWSER_AGENT_TIMEOUT", "600"))
 
 # Responses API 支援的 tool type（不支援的會被過濾）
 _SUPPORTED_TOOL_TYPES = {"web_search_preview", "code_interpreter", "browser_automation_preview"}
+
+# YAML declarative agent 目錄
+_PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
+
+# YAML tool kind → Responses API tool type 對應
+_YAML_KIND_TO_TOOL_TYPE: dict[str, str] = {
+    "WebSearch": "web_search_preview",
+    "CodeInterpreter": "code_interpreter",
+    "BrowserAutomation": "browser_automation_preview",
+}
 
 # 某些 model 不支援特定 tool；遇到時移除該 tool 而非整個失敗
 _MODEL_TOOL_EXCLUSIONS: dict[str, set[str]] = {
@@ -105,27 +122,105 @@ class _AgentDef:
 _agent_def_cache: dict[str, _AgentDef] = {}
 
 
+def _load_agent_def_from_yaml(agent_name: str) -> _AgentDef | None:
+    """
+    從 prompts/{agent_name}.yaml 載入 agent 定義。
+
+    YAML 格式（declarative agent）：
+      kind: Prompt
+      name: <agent-name>
+      instructions: |
+        ...
+      model:
+        id: <model-id>
+      tools:
+        - kind: WebSearch
+        - kind: CodeInterpreter
+        - kind: BrowserAutomation
+
+    Returns:
+        _AgentDef if YAML exists and is valid, None otherwise.
+    """
+    yaml_path = _PROMPTS_DIR / f"{agent_name}.yaml"
+    if not yaml_path.exists():
+        return None
+
+    try:
+        with open(yaml_path, "r", encoding="utf-8") as f:
+            doc = yaml.safe_load(f)
+    except Exception as exc:
+        logger.warning("[YAML] Failed to parse %s: %s", yaml_path, exc)
+        return None
+
+    if not isinstance(doc, dict) or doc.get("kind") != "Prompt":
+        logger.warning("[YAML] Invalid kind in %s (expected 'Prompt')", yaml_path)
+        return None
+
+    model_cfg = doc.get("model", {})
+    model = model_cfg.get("id", "gpt-5.2") if isinstance(model_cfg, dict) else "gpt-5.2"
+    instructions = doc.get("instructions", "") or ""
+
+    # 轉換 YAML tools → Responses API tools
+    yaml_tools: list = doc.get("tools") or []
+    exclusions = _MODEL_TOOL_EXCLUSIONS.get(model, set())
+    tools: list[dict[str, Any]] = []
+    for t in yaml_tools:
+        kind = t.get("kind", "") if isinstance(t, dict) else ""
+        tool_type = _YAML_KIND_TO_TOOL_TYPE.get(kind)
+        if not tool_type:
+            logger.warning("[YAML] Unknown tool kind=%s in %s, skipping", kind, agent_name)
+            continue
+        if tool_type not in _SUPPORTED_TOOL_TYPES:
+            logger.warning("[YAML] Unsupported tool type=%s for agent=%s", tool_type, agent_name)
+            continue
+        if tool_type in exclusions:
+            logger.warning("[YAML] Skipping tool type=%s (incompatible with model=%s)", tool_type, model)
+            continue
+        tool_dict: dict[str, Any] = {"type": tool_type}
+        # 保留 kind 以外的額外屬性
+        for k, v in t.items():
+            if k != "kind":
+                tool_dict[k] = v
+        tools.append(tool_dict)
+
+    result = _AgentDef(model=model, instructions=instructions, tools=tools)
+    logger.info(
+        "[YAML] Loaded agent def from YAML: name=%s model=%s tools=%s instructions_len=%d",
+        agent_name, model, [t["type"] for t in tools], len(instructions),
+    )
+    return result
+
+
 async def _get_agent_def(client: AIProjectClient, agent_name: str) -> _AgentDef:
     """
-    取得 Foundry agent 定義（含快取）。
-    使用 agents.get(name) → versions.latest.definition。
+    取得 agent 定義（含快取）。
+
+    優先順序：
+      1. 記憶體快取
+      2. 本地 YAML 檔案（prompts/{agent_name}.yaml）— source of truth
+      3. Foundry API fallback（agents.get → versions.latest.definition）
     """
     if agent_name in _agent_def_cache:
         return _agent_def_cache[agent_name]
 
+    # --- 嘗試從 YAML 載入（source of truth）---
+    yaml_def = _load_agent_def_from_yaml(agent_name)
+    if yaml_def is not None:
+        _agent_def_cache[agent_name] = yaml_def
+        return yaml_def
+
+    # --- Fallback: Foundry API ---
+    logger.info("[Foundry] YAML not found for %s, falling back to Foundry API", agent_name)
     agent = await client.agents.get(agent_name)
     defn = agent["versions"]["latest"]["definition"]
 
-    # azure-ai-projects 2.x: AgentDefinition is dict-like; use .get() for fields
     model = defn.get("model") or "gpt-5.2"
     instructions = defn.get("instructions") or ""
 
-    # 過濾 tools：僅保留 Responses API 支援且該 model 相容的 tool
     raw_tools: list = defn.get("tools") or []
     exclusions = _MODEL_TOOL_EXCLUSIONS.get(model, set())
     tools: list[dict[str, Any]] = []
     for t in raw_tools:
-        # SDK model 物件 → plain dict（遞迴序列化）
         t_dict = _to_plain_dict(t)
         t_type = t_dict.get("type", "")
         if t_type not in _SUPPORTED_TOOL_TYPES:
@@ -139,7 +234,7 @@ async def _get_agent_def(client: AIProjectClient, agent_name: str) -> _AgentDef:
     result = _AgentDef(model=model, instructions=instructions, tools=tools)
     _agent_def_cache[agent_name] = result
     logger.info(
-        "[Foundry] Cached agent def: name=%s model=%s tools=%s instructions_len=%d",
+        "[Foundry] Cached agent def (API fallback): name=%s model=%s tools=%s instructions_len=%d",
         agent_name, model, [t["type"] for t in tools], len(instructions),
     )
     return result
@@ -188,59 +283,73 @@ async def _invoke_foundry_agent(
     for attempt in range(1, retries + 2):
         credential = DefaultAzureCredential()
         try:
-            print(
-                f"  [Foundry] 呼叫 agent={agent_name} (attempt {attempt}/{retries + 1}, timeout={timeout}s) …",
-                flush=True,
-            )
-            logger.info(
-                "[Foundry] Invoking agent=%s attempt=%d/%d prev_id=%s",
-                agent_name, attempt, retries + 1, previous_response_id or "(none)",
-            )
-            async with AIProjectClient(
-                endpoint=PROJECT_ENDPOINT,
-                credential=credential,
-            ) as client:
-                # 1. 取得 agent 定義
-                agent_def = await _get_agent_def(client, agent_name)
-
-                # 2. 取得 OpenAI client（Responses API）
-                openai = client.get_openai_client()
-
-                # 3. 建構 responses.create 參數
-                create_kwargs: dict[str, Any] = {
-                    "model": agent_def.model,
-                    "input": message,
-                    "store": store,
-                }
-                if previous_response_id:
-                    create_kwargs["previous_response_id"] = previous_response_id
-                if agent_def.instructions:
-                    create_kwargs["instructions"] = agent_def.instructions
-                if agent_def.tools:
-                    create_kwargs["tools"] = agent_def.tools
-
-                # 4. 呼叫 Responses API（帶 timeout 防止 408）
-                response = await openai.responses.create(
-                    **create_kwargs,
-                    timeout=timeout,
-                )
-
-                # 5. 取得回應文字 + response.id (multi-turn 鏈)
-                response_text = response.output_text or ""
-                response_id = response.id or ""
-                logger.info(
-                    "[Foundry] agent=%s model=%s response_length=%d response_id=%s",
-                    agent_name, agent_def.model, len(response_text), response_id,
-                )
-
-                if not response_text.strip():
-                    raise RuntimeError("Empty response from Responses API")
-
+            with _tracer.start_as_current_span(
+                f"invoke_foundry_agent:{agent_name}",
+                attributes={
+                    "agent.name": agent_name,
+                    "agent.attempt": attempt,
+                    "agent.max_retries": retries,
+                    "agent.timeout_s": timeout,
+                    "agent.has_prev_response": bool(previous_response_id),
+                },
+            ) as span:
                 print(
-                    f"  [Foundry] ✅ agent={agent_name} 回覆完成 (response_length={len(response_text)})",
+                    f"  [Foundry] 呼叫 agent={agent_name} (attempt {attempt}/{retries + 1}, timeout={timeout}s) …",
                     flush=True,
                 )
-                return response_text, response_id
+                logger.info(
+                    "[Foundry] Invoking agent=%s attempt=%d/%d prev_id=%s",
+                    agent_name, attempt, retries + 1, previous_response_id or "(none)",
+                )
+                async with AIProjectClient(
+                    endpoint=PROJECT_ENDPOINT,
+                    credential=credential,
+                ) as client:
+                    # 1. 取得 agent 定義
+                    agent_def = await _get_agent_def(client, agent_name)
+                    span.set_attribute("agent.model", agent_def.model)
+                    span.set_attribute("agent.tools_count", len(agent_def.tools))
+
+                    # 2. 取得 OpenAI client（Responses API）
+                    openai = client.get_openai_client()
+
+                    # 3. 建構 responses.create 參數
+                    create_kwargs: dict[str, Any] = {
+                        "model": agent_def.model,
+                        "input": message,
+                        "store": store,
+                    }
+                    if previous_response_id:
+                        create_kwargs["previous_response_id"] = previous_response_id
+                    if agent_def.instructions:
+                        create_kwargs["instructions"] = agent_def.instructions
+                    if agent_def.tools:
+                        create_kwargs["tools"] = agent_def.tools
+
+                    # 4. 呼叫 Responses API（帶 timeout 防止 408）
+                    response = await openai.responses.create(
+                        **create_kwargs,
+                        timeout=timeout,
+                    )
+
+                    # 5. 取得回應文字 + response.id (multi-turn 鏈)
+                    response_text = response.output_text or ""
+                    response_id = response.id or ""
+                    span.set_attribute("agent.response_length", len(response_text))
+                    span.set_attribute("agent.response_id", response_id)
+                    logger.info(
+                        "[Foundry] agent=%s model=%s response_length=%d response_id=%s",
+                        agent_name, agent_def.model, len(response_text), response_id,
+                    )
+
+                    if not response_text.strip():
+                        raise RuntimeError("Empty response from Responses API")
+
+                    print(
+                        f"  [Foundry] ✅ agent={agent_name} 回覆完成 (response_length={len(response_text)})",
+                        flush=True,
+                    )
+                    return response_text, response_id
 
         except Exception as exc:
             last_error = exc

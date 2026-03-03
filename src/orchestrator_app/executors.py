@@ -59,8 +59,12 @@ from .io import (
     write_spec,
     write_terraform_output,
 )
+from .observability import get_tracer
 
 logger = logging.getLogger("orchestrator.executors")
+
+# ── OTel tracer（executor-level custom spans）──
+_tracer = get_tracer()
 
 # ─── Output dir ───
 OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./out"))
@@ -560,8 +564,17 @@ class _MultiTurnAgentExecutor(Executor):
         self._turn = 1
 
         try:
-            raw, rid = await agents.invoke_agent_raw(self._agent_name, prompt)
-            self._response_id = rid
+            with _tracer.start_as_current_span(
+                f"executor:{self._step_label}",
+                attributes={
+                    "executor.step": self._step_label,
+                    "executor.agent_name": self._agent_name,
+                    "executor.turn": 1,
+                    "executor.prompt_length": len(prompt),
+                },
+            ):
+                raw, rid = await agents.invoke_agent_raw(self._agent_name, prompt)
+                self._response_id = rid
         except Exception as exc:
             logger.error("[%s] invoke_agent_raw failed: %s", self.id, exc)
             await self._handle_error(ctx, str(exc), messages)

@@ -51,6 +51,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("orchestrator")
 
+# ─── Observability（在 import executors 之前初始化，確保 spans 能捕捉）───
+from orchestrator_app.observability import setup_observability  # noqa: E402
+
+setup_observability()
+
 # ─── Executors & contracts ───
 from orchestrator_app.contracts import AgentAnswer, AgentQuestion  # noqa: E402
 from orchestrator_app.executors import (  # noqa: E402

@@ -1,0 +1,47 @@
+# ============================================================
+# Agent-AzureCalculator-BrowserAuto — Declarative YAML
+# ============================================================
+# ⚠️  This agent does NOT yet exist on Microsoft Foundry (404 on pull).
+#     This YAML is a local-only definition. Deploy to Foundry via:
+#     python -m orchestrator_app.agent_sync push Agent-AzureCalculator-BrowserAuto
+# ============================================================
+
+kind: Prompt
+name: Agent-AzureCalculator-BrowserAuto
+instructions: |
+  TASK: Use Browser Automation to create an Azure Pricing Calculator estimate.
+
+  You are given a cost_structure.json containing detailed line-items with
+  product_id, sku, region, quantity, pricing_tier for each Azure resource.
+
+  Steps:
+  1. Navigate to https://azure.microsoft.com/en-us/pricing/calculator/
+  2. For EACH line-item in the cost structure:
+     a. Search for the product using product_id or display_name
+     b. Add it to the estimate
+     c. Configure: region, SKU/tier, pricing_tier (PAYG/RI), quantity
+  3. After adding ALL resources, get the SHARE link (click Share → copy URL)
+  4. Export the estimate as Excel file
+  5. Return the results
+
+  You MUST return a valid JSON object (or wrap in ```json``` code block) with these keys:
+  - "calculator_share_url": the Azure Calculator share link
+  - "estimate_xlsx_base64": base64-encoded exported Excel file (or "" if export failed)
+  - "monthly_estimate_usd": total monthly cost from the calculator (number)
+  - "cost_breakdown": list of {"resource": "...", "sku": "...", "monthly_usd": ...}
+
+  IMPORTANT:
+  - Use Browser Automation to interact with the Azure Pricing Calculator website.
+  - Do NOT ask clarifying questions. Work with the data provided.
+  - If browser automation fails for a specific resource, skip it and note in cost_breakdown.
+  - The share URL is critical — make sure to obtain it.
+
+model:
+  id: gpt-5.2
+  connection:
+    kind: Remote
+    endpoint: =Env.AZURE_AI_PROJECT_ENDPOINT
+
+tools:
+  - kind: BrowserAutomation
+  - kind: WebSearch
