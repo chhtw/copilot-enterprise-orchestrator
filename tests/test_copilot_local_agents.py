@@ -4,6 +4,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from agent_framework import AgentResponse, AgentResponseUpdate, Content, ResponseStream
 
 
 class TestCopilotLocalAgents:
@@ -393,6 +394,145 @@ class TestCopilotLocalAgents:
         assert any(event["stage"] == "agent.run.stuck" for event in session_payload["events"])
         assert any(event["event_type"] == "attempt.retry_scheduled" for event in session_payload["events"])
         assert any(event["event_type"] == "turn.completed" for event in session_payload["events"])
+
+    @pytest.mark.asyncio
+    async def test_run_prompt_records_stream_progress_events_and_completes(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ):
+        from orchestrator_app import copilot_local_agents as mod
+        from orchestrator_app import io as artifact_io
+
+        mod._SESSIONS.clear()
+
+        async def fake_auth_status():
+            return mod._CopilotAuthStatus(True, login="demo-user", status_message=None)
+
+        class FakeCopilotClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def stop(self):
+                return None
+
+        class FakeGitHubCopilotAgent:
+            def __init__(self, *, instructions=None, client=None, default_options=None, **kwargs):
+                return None
+
+            async def start(self):
+                return None
+
+            def run(self, messages, session=None, options=None, stream=False, **kwargs):
+                assert stream is True
+
+                async def update_stream():
+                    yield AgentResponseUpdate(
+                        contents=[Content.from_text("chunk-1")],
+                        role="assistant",
+                        response_id="resp-1",
+                    )
+                    await asyncio.sleep(0.005)
+                    yield AgentResponseUpdate(
+                        contents=[Content.from_text("chunk-2")],
+                        role="assistant",
+                        response_id="resp-1",
+                    )
+
+                return ResponseStream(update_stream(), finalizer=AgentResponse.from_updates)
+
+            async def stop(self):
+                return None
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
+        monkeypatch.setenv("GITHUB_COPILOT_MAX_RESTARTS", "0")
+        monkeypatch.setenv("GITHUB_COPILOT_PROGRESS_TIMEOUT", "0.02")
+        monkeypatch.setattr(mod, "_get_copilot_auth_status", fake_auth_status)
+        monkeypatch.setattr(mod, "CopilotClient", FakeCopilotClient)
+        monkeypatch.setattr(mod, "GitHubCopilotAgent", FakeGitHubCopilotAgent)
+
+        agent = mod.DiagramCopilotAgent()
+        text, session_id = await agent.run_prompt("hello")
+        session_payload = artifact_io.read_copilot_session_state(session_id)
+
+        assert text == "chunk-1chunk-2"
+        assert session_payload is not None
+        assert any(event["event_type"] == "attempt.progress" for event in session_payload["events"])
+        assert any(event["stage"] == "agent.run.completed" for event in session_payload["events"])
+        assert not any(event["stage"] == "agent.run.stuck" for event in session_payload["events"])
+
+    @pytest.mark.asyncio
+    async def test_run_prompt_distinguishes_overall_timeout_from_stuck(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ):
+        from orchestrator_app import copilot_local_agents as mod
+        from orchestrator_app import io as artifact_io
+
+        mod._SESSIONS.clear()
+        run_attempts = {"count": 0}
+        session_id = "session-overall-timeout"
+
+        async def fake_auth_status():
+            return mod._CopilotAuthStatus(True, login="demo-user", status_message=None)
+
+        class FakeCopilotClient:
+            def __init__(self, options):
+                self.options = options
+
+            async def stop(self):
+                return None
+
+        class FakeGitHubCopilotAgent:
+            def __init__(self, *, instructions=None, client=None, default_options=None, **kwargs):
+                return None
+
+            async def start(self):
+                return None
+
+            def run(self, messages, session=None, options=None, stream=False, **kwargs):
+                run_attempts["count"] += 1
+                assert stream is True
+
+                async def update_stream():
+                    index = 0
+                    while True:
+                        index += 1
+                        yield AgentResponseUpdate(
+                            contents=[Content.from_text(f"chunk-{index}")],
+                            role="assistant",
+                            response_id="resp-timeout",
+                        )
+                        await asyncio.sleep(0.02)
+
+                return ResponseStream(update_stream(), finalizer=AgentResponse.from_updates)
+
+            async def stop(self):
+                return None
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
+        monkeypatch.setenv("GITHUB_COPILOT_MAX_RESTARTS", "1")
+        monkeypatch.setenv("GITHUB_COPILOT_RETRY_DELAY", "0")
+        monkeypatch.setattr(mod, "_get_copilot_auth_status", fake_auth_status)
+        monkeypatch.setattr(mod, "CopilotClient", FakeCopilotClient)
+        monkeypatch.setattr(mod, "GitHubCopilotAgent", FakeGitHubCopilotAgent)
+
+        agent = mod.DiagramCopilotAgent()
+        agent._timeout = 0.05
+        agent._progress_timeout = 0.03
+
+        with pytest.raises(RuntimeError, match="overall timeout"):
+            await agent.run_prompt("hello", session_id=session_id)
+
+        session_payload = artifact_io.read_copilot_session_state(session_id)
+        assert run_attempts["count"] == 1
+        assert session_payload is not None
+        assert any(event["event_type"] == "attempt.progress" for event in session_payload["events"])
+        assert any(event["stage"] == "run_prompt.failed" for event in session_payload["events"])
+        assert not any(event["stage"] == "agent.run.stuck" for event in session_payload["events"])
 
     @pytest.mark.asyncio
     async def test_startup_preflight_records_healthy_snapshot(self, monkeypatch):

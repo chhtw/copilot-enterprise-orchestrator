@@ -185,11 +185,13 @@ class _CopilotInvocationError(RuntimeError):
         *,
         retryable: bool,
         cause: Exception | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.stage = stage
         self.retryable = retryable
         self.cause = cause
+        self.metadata = metadata or {}
 
 
 @dataclass
@@ -434,13 +436,33 @@ def _format_copilot_error(
     attempts: int = 1,
 ) -> str:
     error_text = str(error)
+    metadata = error.metadata if isinstance(error, _CopilotInvocationError) else {}
     stage_text = f", stage={stage}" if stage else ""
     attempts_text = f", attempts={attempts}" if attempts > 1 else ""
     if stage == "agent.run.stuck":
+        progress_count = metadata.get("progress_count")
+        progress_text = (
+            f" after {progress_count} streamed updates"
+            if isinstance(progress_count, int) and progress_count > 0
+            else ""
+        )
         return (
             f"Local GitHub Copilot provider showed no completion progress within {timeout}s "
-            f"(agent={agent_name}, model={model or 'default'}{stage_text}{attempts_text}, {_format_auth_status(auth_status)}). "
+            f"(agent={agent_name}, model={model or 'default'}{stage_text}{attempts_text}, {_format_auth_status(auth_status)}){progress_text}. "
             "The local client was proactively restarted before the overall provider timeout elapsed. "
+            f"Original error: {error_text}"
+        )
+    if stage == "agent.run.timeout":
+        progress_count = metadata.get("progress_count")
+        progress_text = (
+            f" after {progress_count} streamed updates"
+            if isinstance(progress_count, int) and progress_count > 0
+            else ""
+        )
+        return (
+            f"Local GitHub Copilot provider did not finish within the overall timeout of {timeout}s "
+            f"(agent={agent_name}, model={model or 'default'}{stage_text}{attempts_text}, {_format_auth_status(auth_status)}){progress_text}. "
+            "The provider showed activity, but the response did not complete before the hard timeout. "
             f"Original error: {error_text}"
         )
     if "session.idle" in error_text:
@@ -535,6 +557,45 @@ def _summarize_result(result: Any) -> dict[str, Any]:
         if isinstance(safe_messages, list):
             payload["message_count"] = len(safe_messages)
     return payload
+
+
+def _summarize_update(update: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "update_type": type(update).__name__,
+    }
+    text = getattr(update, "text", "")
+    if text:
+        payload["text_preview"] = str(text)[:400]
+        payload["text_length"] = len(str(text))
+    role = getattr(update, "role", None)
+    if role:
+        payload["role"] = str(role)
+    response_id = getattr(update, "response_id", None)
+    if response_id:
+        payload["response_id"] = str(response_id)
+    continuation_token = getattr(update, "continuation_token", None)
+    if continuation_token is not None:
+        payload["has_continuation_token"] = True
+    user_input_requests = getattr(update, "user_input_requests", None)
+    if user_input_requests:
+        payload["user_input_request_count"] = len(user_input_requests)
+    contents = getattr(update, "contents", None)
+    if isinstance(contents, list) and contents:
+        payload["content_count"] = len(contents)
+    additional_properties = getattr(update, "additional_properties", None)
+    if isinstance(additional_properties, dict) and additional_properties:
+        payload["additional_properties"] = _json_safe(additional_properties, depth=2)
+    return payload
+
+
+def _should_record_progress_event(update_index: int, update: Any) -> bool:
+    if update_index <= 3 or update_index % 25 == 0:
+        return True
+    if getattr(update, "continuation_token", None) is not None:
+        return True
+    if getattr(update, "user_input_requests", None):
+        return True
+    return False
 
 
 def _append_session_event(
@@ -679,6 +740,169 @@ try:
         def health_snapshot(self) -> dict[str, Any]:
             return get_provider_health_snapshot(self._agent_name)
 
+        @staticmethod
+        def _is_response_stream(candidate: Any) -> bool:
+            return hasattr(candidate, "__aiter__") and hasattr(candidate, "get_final_response")
+
+        async def _consume_response_stream(
+            self,
+            stream: Any,
+            *,
+            event_recorder: Any = None,
+        ) -> Any:
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            last_progress_at = started
+            progress_count = 0
+            iterator = stream.__aiter__()
+
+            while True:
+                elapsed = loop.time() - started
+                overall_remaining = float(self._timeout) - elapsed if self._timeout > 0 else None
+                idle_remaining = self._progress_timeout if self._progress_timeout > 0 else None
+                wait_candidates = [
+                    value
+                    for value in (overall_remaining, idle_remaining)
+                    if value is not None and value > 0
+                ]
+
+                if overall_remaining is not None and overall_remaining <= 0:
+                    raise _CopilotInvocationError(
+                        "agent.run.timeout",
+                        f"GitHub Copilot agent did not complete within {self._timeout}s",
+                        retryable=False,
+                        metadata={
+                            "progress_count": progress_count,
+                            "elapsed_s": elapsed,
+                            "last_progress_age_s": loop.time() - last_progress_at,
+                        },
+                    )
+
+                wait_timeout = min(wait_candidates) if wait_candidates else None
+                timed_out_on_overall = (
+                    wait_timeout is not None
+                    and overall_remaining is not None
+                    and wait_timeout == overall_remaining
+                    and (idle_remaining is None or overall_remaining <= idle_remaining)
+                )
+
+                try:
+                    if wait_timeout is not None:
+                        update = await asyncio.wait_for(iterator.__anext__(), timeout=wait_timeout)
+                    else:
+                        update = await iterator.__anext__()
+                except StopAsyncIteration:
+                    final_response = await stream.get_final_response()
+                    if event_recorder is not None:
+                        event_recorder(
+                            event_type="attempt.stage",
+                            stage="agent.run.completed",
+                            detail="GitHub Copilot response received",
+                            payload={
+                                **_summarize_result(final_response),
+                                "streamed_updates": progress_count,
+                                "duration_s": loop.time() - started,
+                                "last_progress_age_s": loop.time() - last_progress_at,
+                            },
+                        )
+                    return final_response
+                except asyncio.TimeoutError as exc:
+                    elapsed = loop.time() - started
+                    metadata = {
+                        "progress_count": progress_count,
+                        "elapsed_s": elapsed,
+                        "last_progress_age_s": loop.time() - last_progress_at,
+                    }
+                    if timed_out_on_overall:
+                        raise _CopilotInvocationError(
+                            "agent.run.timeout",
+                            f"GitHub Copilot agent did not complete within {self._timeout}s",
+                            retryable=False,
+                            cause=exc,
+                            metadata=metadata,
+                        ) from exc
+                    raise _CopilotInvocationError(
+                        "agent.run.stuck",
+                        (
+                            "GitHub Copilot agent showed no completion progress "
+                            f"within {self._progress_timeout}s"
+                        ),
+                        retryable=True,
+                        cause=exc,
+                        metadata=metadata,
+                    ) from exc
+
+                progress_count += 1
+                last_progress_at = loop.time()
+                if event_recorder is not None and _should_record_progress_event(progress_count, update):
+                    event_recorder(
+                        event_type="attempt.progress",
+                        stage="agent.run.progress",
+                        detail=f"received streaming update {progress_count}",
+                        payload={
+                            "update_index": progress_count,
+                            "elapsed_s": last_progress_at - started,
+                            **_summarize_update(update),
+                        },
+                    )
+
+        async def _await_direct_response(
+            self,
+            run_result: Any,
+            *,
+            event_recorder: Any = None,
+        ) -> Any:
+            if asyncio.iscoroutine(run_result) or isinstance(run_result, asyncio.Future):
+                timeout = None
+                if self._progress_timeout > 0:
+                    timeout = self._progress_timeout
+                elif self._timeout > 0:
+                    timeout = float(self._timeout)
+                started = asyncio.get_running_loop().time()
+                try:
+                    if timeout is not None:
+                        result = await asyncio.wait_for(run_result, timeout=timeout)
+                    else:
+                        result = await run_result
+                except asyncio.TimeoutError as exc:
+                    elapsed = asyncio.get_running_loop().time() - started
+                    raise _CopilotInvocationError(
+                        "agent.run.stuck",
+                        (
+                            "GitHub Copilot agent showed no completion progress "
+                            f"within {self._progress_timeout}s"
+                        ),
+                        retryable=True,
+                        cause=exc,
+                        metadata={
+                            "progress_count": 0,
+                            "elapsed_s": elapsed,
+                            "last_progress_age_s": elapsed,
+                        },
+                    ) from exc
+                if event_recorder is not None:
+                    event_recorder(
+                        event_type="attempt.stage",
+                        stage="agent.run.completed",
+                        detail="GitHub Copilot response received",
+                        payload={
+                            **_summarize_result(result),
+                            "streamed_updates": 0,
+                        },
+                    )
+                return result
+            if event_recorder is not None:
+                event_recorder(
+                    event_type="attempt.stage",
+                    stage="agent.run.completed",
+                    detail="GitHub Copilot response received",
+                    payload={
+                        **_summarize_result(run_result),
+                        "streamed_updates": 0,
+                    },
+                )
+            return run_result
+
         async def _run_with_copilot_agent(
             self,
             *,
@@ -757,19 +981,25 @@ try:
                             payload={
                                 "timeout": self._timeout,
                                 "progress_timeout": self._progress_timeout,
+                                "stream": True,
                             },
                         )
-                    run_coro = agent.run(messages, session=session, options=default_options, **kwargs)
-                    if self._progress_timeout > 0:
-                        result = await asyncio.wait_for(run_coro, timeout=self._progress_timeout)
+                    run_result = agent.run(
+                        messages,
+                        session=session,
+                        options=default_options,
+                        stream=True,
+                        **kwargs,
+                    )
+                    if self._is_response_stream(run_result):
+                        result = await self._consume_response_stream(
+                            run_result,
+                            event_recorder=event_recorder,
+                        )
                     else:
-                        result = await run_coro
-                    if event_recorder is not None:
-                        event_recorder(
-                            event_type="attempt.stage",
-                            stage="agent.run.completed",
-                            detail="GitHub Copilot response received",
-                            payload=_summarize_result(result),
+                        result = await self._await_direct_response(
+                            run_result,
+                            event_recorder=event_recorder,
                         )
                     return result
                 except asyncio.TimeoutError as exc:
@@ -781,7 +1011,10 @@ try:
                         ),
                         retryable=True,
                         cause=exc,
+                        metadata={"progress_count": 0},
                     ) from exc
+                except _CopilotInvocationError:
+                    raise
                 except Exception as exc:
                     raise _CopilotInvocationError(
                         "agent.run",

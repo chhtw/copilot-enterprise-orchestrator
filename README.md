@@ -178,8 +178,8 @@ HTTP 模式首個 request 可帶入：
 | `TERRAFORM_AGENT_TIMEOUT` | `300` | Terraform agent timeout；若未設定 `GITHUB_COPILOT_TIMEOUT`，本地 Copilot terraform agent 也會回退使用此值 |
 | `COST_STRUCTURE_AGENT_TIMEOUT` | `300` | Pricing structure agent timeout |
 | `COST_BROWSER_AGENT_TIMEOUT` | `600` | Browser pricing agent timeout |
-| `GITHUB_COPILOT_TIMEOUT` | `1200` | 本地 Copilot provider timeout；優先於 `DIAGRAM_AGENT_TIMEOUT` / `TERRAFORM_AGENT_TIMEOUT`，未設定且沒有 agent-specific timeout 時也會使用此預設值 |
-| `GITHUB_COPILOT_PROGRESS_TIMEOUT` | `180` | 本地 Copilot 單次 invoke 的卡住偵測上限秒數；若 provider 在此時間內完全沒有完成，會先主動中止並重建 client，再交給既有 retry 機制 |
+| `GITHUB_COPILOT_TIMEOUT` | `1200` | 本地 Copilot provider 的整體 hard timeout；優先於 `DIAGRAM_AGENT_TIMEOUT` / `TERRAFORM_AGENT_TIMEOUT`，未設定且沒有 agent-specific timeout 時也會使用此預設值 |
+| `GITHUB_COPILOT_PROGRESS_TIMEOUT` | `180` | 本地 Copilot 單次 invoke 的 idle timeout；只要 provider 在此時間內完全沒有任何串流更新或完成結果，就會判定為 stuck 並重建 client |
 | `GITHUB_COPILOT_MAX_RESTARTS` | `1` | 本地 Copilot provider 不健康時，最多重建 client/agent 的次數 |
 | `GITHUB_COPILOT_RETRY_DELAY` | `2.0` | 本地 Copilot provider 重建前的初始等待秒數，後續採 exponential backoff |
 | `GITHUB_COPILOT_STARTUP_PREFLIGHT` | `true` | 在 CLI / server 啟動時先驗證本地 Copilot provider 是否可用；`MOCK_MODE=true` 時自動跳過 |
@@ -187,7 +187,7 @@ HTTP 模式首個 request 可帶入：
 
 > 本地 Copilot 多輪 session 會持久化到 `OUTPUT_DIR/.copilot_sessions/`。若程序重啟，只要 workflow checkpoint 還保留同一個 `response_id`（本地 Copilot 路徑實際上是 session id），續輪時會自動從磁碟恢復對話歷史。
 >
-> Session payload 現在除了 `turns` 之外，還會持久化 `events`，記錄 preflight、attempt、stuck timeout、retry、最終完成或失敗等執行軌跡。即使本次 invoke 尚未成功回傳最終文字，也會先把事件寫進 `OUTPUT_DIR/.copilot_sessions/`，方便事後檢查。
+> Session payload 現在除了 `turns` 之外，還會持久化 `events`，記錄 preflight、attempt、串流 progress、stuck timeout、overall timeout、retry、最終完成或失敗等執行軌跡。即使本次 invoke 尚未成功回傳最終文字，也會先把事件寫進 `OUTPUT_DIR/.copilot_sessions/`，方便事後檢查。
 >
 > 本地 Copilot provider 會輸出 `[CopilotHealth]` 結構化 log，並寫出 OTel metrics：健康事件、client/agent 重建次數、preflight/invoke latency。若有 Application Insights，這些訊號會跟著既有 telemetry 一起匯出。
 
