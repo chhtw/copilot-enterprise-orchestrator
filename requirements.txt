@@ -1,9 +1,10 @@
 # ===== Microsoft Agent Framework =====
 agent-framework-azure-ai==1.0.0rc2
-agent-framework-core==1.0.0rc2
+agent-framework-core==1.0.0rc3
+agent-framework-github-copilot==1.0.0b260304
 
 # ===== Azure AI Projects SDK =====
-azure-ai-projects==2.0.0b3
+azure-ai-projects==2.0.0
 azure-identity>=1.25.2
 
 # ===== Data & Utils =====

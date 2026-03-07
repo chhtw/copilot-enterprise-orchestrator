@@ -2,15 +2,15 @@
 main.py — Orchestrator entrypoint (HTTP Server / CLI)
 
 Uses WorkflowBuilder to chain executors with multi-turn support:
-  1. NormalizeExecutor          — 使用者輸入 → Spec
-    2. RequirementClarificationExecutor — 與使用者對話補齊基本規格欄位
+    1. NormalizeExecutor                 — 使用者輸入 → Spec
+    2. RequirementsClarificationExecutor — 與使用者對話補齊基本規格欄位
     3. ArchitectureClarificationExecutor — LLM 架構細節澄清（服務/安全/網路等）
-    4. DiagramExecutor            — 呼叫 DaC-Dagrams-Mingrammer（multi-turn）
-    5. DiagramRenderExecutor      — 本地渲染 diagram.py → PNG
-    6. DiagramApprovalExecutor    — 使用者核准/修訂架構圖（核准後才進行下一步）
-    7. ParallelTerraformCostExecutor — 並行執行 Terraform 與 Agent-AzureCalculator
-    8. Step 3b executor           — Cost Browser 或 Retail API 產生 estimate.xlsx
-    9. SummaryExecutor            — Executive Summary + WorkflowResult
+    4. DiagramGenerationExecutor         — 呼叫 Azure-Diagram-Generation-Agent（multi-turn）
+    5. DiagramRenderingExecutor          — 本地渲染 diagram.py → PNG
+    6. DiagramReviewExecutor             — 使用者核准/修訂架構圖（核准後才進行下一步）
+    7. ParallelTerraformPricingExecutor  — 並行執行 Terraform 與 Azure-Pricing-Structure-Agent
+    8. Step 8 executor                   — Browser 或 Retail API 產生 estimate.xlsx
+    9. SummaryExecutor                   — Executive Summary + WorkflowResult
 
 HTTP mode (RUN_MODE=server):
   from_agent_framework() hosting adapter → localhost:8088
@@ -21,13 +21,14 @@ CLI mode (RUN_MODE=cli, default):
   支援 /done 結束、/skip 跳過。
 
 環境變數：
-  MOCK_MODE=true   → 使用 mock_agents（離線測試）
-  MOCK_MODE=false  → 使用 foundry_agents（真實呼叫 Foundry）
+    MOCK_MODE=true   → 使用 mock provider（離線測試）
+    MOCK_MODE=false  → 使用 hybrid router（Terraform/Diagram 走 GitHub Copilot，其餘走 Foundry）
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -56,19 +57,22 @@ from orchestrator_app.observability import setup_observability  # noqa: E402
 
 setup_observability()
 
+from orchestrator_app import copilot_local_agents  # noqa: E402
+
 # ─── Executors & contracts ───
 from orchestrator_app.contracts import AgentAnswer, AgentQuestion  # noqa: E402
+from orchestrator_app.i18n import DEFAULT_LANGUAGE, ENGLISH, TRADITIONAL_CHINESE, tr  # noqa: E402
 from orchestrator_app.executors import (  # noqa: E402
-    COST_STEP3B_MODE,
+    PRICING_EXECUTION_MODE,
     ArchitectureClarificationExecutor,
-    CostBrowserExecutor,
-    DiagramApprovalExecutor,
-    DiagramExecutor,
-    DiagramRenderExecutor,
+    BrowserPricingExecutor,
+    DiagramGenerationExecutor,
+    DiagramRenderingExecutor,
+    DiagramReviewExecutor,
     NormalizeExecutor,
-    ParallelTerraformCostExecutor,
-    RequirementClarificationExecutor,
-    RetailPricesCostExecutor,
+    ParallelTerraformPricingExecutor,
+    RequirementsClarificationExecutor,
+    RetailPricingExecutor,
     SummaryExecutor,
 )
 
@@ -82,34 +86,34 @@ def build_workflow():
 
     Wiring:
         NormalizeExecutor
-              → RequirementClarificationExecutor   (基本規格欄位澄清)
+              → RequirementsClarificationExecutor  (基本規格欄位澄清)
               → ArchitectureClarificationExecutor  (架構服務/安全/網路細節 LLM 澄清)
-        → DiagramExecutor         (multi-turn)
-        → DiagramRenderExecutor
-              → DiagramApprovalExecutor   (使用者核准後才進行下一步)
-              → ParallelTerraformCostExecutor  — 並行：Terraform + CostStructure
-        → Step 3b executor        — depends on COST_STEP3B_MODE env var:
-            "retail_api" → RetailPricesCostExecutor (local Azure Retail Prices API)
-            "browser"    → CostBrowserExecutor (Foundry browser_automation_preview)
+        → DiagramGenerationExecutor   (multi-turn)
+        → DiagramRenderingExecutor
+              → DiagramReviewExecutor             (使用者核准後才進行下一步)
+              → ParallelTerraformPricingExecutor  — 並行：Terraform + Pricing Structure
+        → Step 8 executor             — depends on PRICING_EXECUTION_MODE env var:
+            "retail_api" → RetailPricingExecutor (local Azure Retail Prices API)
+            "browser"    → BrowserPricingExecutor (Foundry browser_automation_preview)
         → SummaryExecutor
     """
-    # Select Step 3b executor based on env var
-    if COST_STEP3B_MODE == "browser":
-        logger.info("[Workflow] Step 3b: CostBrowserExecutor (Foundry browser_automation_preview)")
-        step3b = CostBrowserExecutor()
+    # Select Step 8 executor based on env var
+    if PRICING_EXECUTION_MODE == "browser":
+        logger.info("[Workflow] Step 8: BrowserPricingExecutor (Foundry browser_automation_preview)")
+        pricing_executor = BrowserPricingExecutor()
     else:
-        logger.info("[Workflow] Step 3b: RetailPricesCostExecutor (Azure Retail Prices API)")
-        step3b = RetailPricesCostExecutor()
+        logger.info("[Workflow] Step 8: RetailPricingExecutor (Azure Retail Prices API)")
+        pricing_executor = RetailPricingExecutor()
 
     executors = [
         NormalizeExecutor(),
-        RequirementClarificationExecutor(),
+        RequirementsClarificationExecutor(),
         ArchitectureClarificationExecutor(),
-        DiagramExecutor(),
-        DiagramRenderExecutor(),
-        DiagramApprovalExecutor(),
-        ParallelTerraformCostExecutor(),
-        step3b,
+        DiagramGenerationExecutor(),
+        DiagramRenderingExecutor(),
+        DiagramReviewExecutor(),
+        ParallelTerraformPricingExecutor(),
+        pricing_executor,
         SummaryExecutor(),
     ]
     return (
@@ -127,7 +131,28 @@ def build_agent():
     multi-turn 互動。
     """
     wf = build_workflow()
-    return wf.as_agent(name="ccoe-orchestrator")
+    return wf.as_agent(name="azure-platform-orchestrator")
+
+
+def _is_mock_mode() -> bool:
+    return os.getenv("MOCK_MODE", "true").lower() in {"true", "1", "yes", "on"}
+
+
+async def _run_startup_preflight_async() -> None:
+    if _is_mock_mode():
+        logger.info("[StartupPreflight] MOCK_MODE=true — skipping local Copilot startup preflight")
+        return
+
+    if not copilot_local_agents._resolve_startup_preflight_enabled():
+        logger.info("[StartupPreflight] %s disabled — skipping local Copilot startup preflight", "GITHUB_COPILOT_STARTUP_PREFLIGHT")
+        return
+
+    report = await copilot_local_agents.startup_preflight(strict=True)
+    logger.info("[StartupPreflight] Local Copilot provider ready: %s", report)
+
+
+def _run_startup_preflight_sync() -> None:
+    asyncio.run(_run_startup_preflight_async())
 
 
 # ======================================================================
@@ -148,6 +173,7 @@ def create_app():
             "is not installed.  Install it or use CLI mode (RUN_MODE=cli)."
         ) from exc
 
+    _run_startup_preflight_sync()
     agent = build_agent()
     app = from_agent_framework(agent)
     return app
@@ -157,6 +183,46 @@ def main():
     """HTTP server 入口。"""
     app = create_app()
     app.run()
+
+
+def _prompt_preferred_language() -> str:
+    """CLI 啟動時先詢問語言。"""
+    print("\n" + "=" * 60, flush=True)
+    print("  Select language / 選擇語言", flush=True)
+    print("=" * 60, flush=True)
+    print("  1. 繁體中文", flush=True)
+    print("  2. English", flush=True)
+    try:
+        choice = input("> ").strip().lower()
+    except EOFError:
+        choice = ""
+
+    if choice in {"2", "en", "english", "en-us"}:
+        return ENGLISH
+    return TRADITIONAL_CHINESE
+
+
+def _build_initial_payload(user_input: str, preferred_language: str) -> str:
+    try:
+        parsed = json.loads(user_input)
+    except (json.JSONDecodeError, TypeError):
+        parsed = None
+
+    if isinstance(parsed, dict):
+        payload = dict(parsed)
+        payload["preferred_language"] = preferred_language
+        payload.setdefault("raw_input", user_input)
+        payload.setdefault("notes", payload.get("notes") or user_input)
+        return json.dumps(payload, ensure_ascii=False)
+
+    return json.dumps(
+        {
+            "preferred_language": preferred_language,
+            "raw_input": user_input,
+            "notes": user_input,
+        },
+        ensure_ascii=False,
+    )
 
 
 # ======================================================================
@@ -176,15 +242,17 @@ async def cli_run():
     """
     import json as _json
 
+    preferred_language = _prompt_preferred_language()
+
     # ── 取得使用者輸入 ──
     if len(sys.argv) > 1:
         user_input = " ".join(sys.argv[1:])
     else:
         print("\n" + "=" * 60, flush=True)
-        print("  CCoE Orchestrator — CLI 模式（Multi-Turn）", flush=True)
+        print(tr(preferred_language, "  CCoE Orchestrator — CLI 模式（Multi-Turn）", "  CCoE Orchestrator — CLI Mode (Multi-Turn)"), flush=True)
         print("=" * 60, flush=True)
-        print("請輸入您的 Azure 架構需求（輸入完按 Enter）：", flush=True)
-        print("  💡 Agent 追問時可用 /done 結束、/skip 跳過", flush=True)
+        print(tr(preferred_language, "請輸入您的 Azure 架構需求（輸入完按 Enter）：", "Describe your Azure architecture requirements and press Enter:"), flush=True)
+        print(tr(preferred_language, "  💡 Agent 追問時可用 /done 結束、/skip 跳過", "  💡 During follow-up questions, use /done to continue or /skip to skip"), flush=True)
         try:
             user_input = input("> ").strip()
         except EOFError:
@@ -195,18 +263,32 @@ async def cli_run():
             "我需要一個 Azure 環境，包含 App Service + VNet + Subnet，"
             "部署在 eastasia，環境數量 2 (dev + prod)，幣別 TWD。"
         )
-        print(f"[INFO] 使用預設輸入: {user_input}", flush=True)
+        print(
+            tr(
+                preferred_language,
+                f"[INFO] 使用預設輸入: {user_input}",
+                f"[INFO] Using default input: {user_input}",
+            ),
+            flush=True,
+        )
+
+    initial_payload = _build_initial_payload(user_input, preferred_language)
 
     print(
-        f"\n📥 收到需求: {user_input[:100]}{'...' if len(user_input) > 100 else ''}",
+        tr(
+            preferred_language,
+            f"\n📥 收到需求: {user_input[:100]}{'...' if len(user_input) > 100 else ''}",
+            f"\n📥 Received request: {user_input[:100]}{'...' if len(user_input) > 100 else ''}",
+        ),
         flush=True,
     )
-    print("🚀 開始執行 Orchestrator Workflow...\n", flush=True)
+    print(tr(preferred_language, "🚀 開始執行 Orchestrator Workflow...\n", "🚀 Starting the Orchestrator workflow...\n"), flush=True)
 
     # ── 建立 agent 與 session ──
+    await _run_startup_preflight_async()
     agent = build_agent()
     session = agent.create_session()
-    messages = [Message(role="user", text=user_input)]
+    messages = [Message(role="user", text=initial_payload)]
 
     response: AgentResponse = await agent.run(messages, session=session)
     _display_agent_response(response)
@@ -225,7 +307,11 @@ async def cli_run():
 
             print(f"\n{'─' * 50}", flush=True)
             print(
-                f"❓ [{question.agent_name}] (turn {question.turn}):",
+                tr(
+                    question.preferred_language,
+                    f"❓ [{question.agent_name}] (第 {question.turn} 輪):",
+                    f"❓ [{question.agent_name}] (turn {question.turn}):",
+                ),
                 flush=True,
             )
             print(f"   {question.question_text}", flush=True)
@@ -261,7 +347,7 @@ async def cli_run():
         _display_agent_response(response)
 
     # ── 結束 ──
-    print("\n✅ Workflow 結束", flush=True)
+    print(tr(preferred_language, "\n✅ Workflow 結束", "\n✅ Workflow finished"), flush=True)
 
 
 def _display_agent_response(response: AgentResponse) -> None:

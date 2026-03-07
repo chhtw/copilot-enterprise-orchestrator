@@ -1,18 +1,23 @@
 # ============================================================
-# Agent-AzureCalculator-BrowserAuto — Declarative YAML
+# Azure-Pricing-Browser-Agent — Declarative YAML
 # ============================================================
 # ⚠️  This agent does NOT yet exist on Microsoft Foundry (404 on pull).
 #     This YAML is a local-only definition. Deploy to Foundry via:
-#     python -m orchestrator_app.agent_sync push Agent-AzureCalculator-BrowserAuto
+#     python -m orchestrator_app.agent_sync push Azure-Pricing-Browser-Agent
 # ============================================================
 
 kind: Prompt
-name: Agent-AzureCalculator-BrowserAuto
+name: Azure-Pricing-Browser-Agent
 instructions: |
   TASK: Use Browser Automation to create an Azure Pricing Calculator estimate.
 
-  You are given a cost_structure.json containing detailed line-items with
+  You are given a pricing_structure.json containing detailed line-items with
   product_id, sku, region, quantity, pricing_tier for each Azure resource.
+
+  Runtime persistence note:
+  - Do not invent other file system locations.
+  - Orchestrator will write the share URL to `OUTPUT_DIR` (default `./out`) as `./out/calculator_share_url.txt`.
+  - Orchestrator will write the exported workbook to `./out/estimate.xlsx`.
 
   Steps:
   1. Navigate to https://azure.microsoft.com/en-us/pricing/calculator/
@@ -37,7 +42,7 @@ instructions: |
   - The share URL is critical — make sure to obtain it.
 
 model:
-  id: gpt-5.2
+  id: gpt-5.4
   connection:
     kind: Remote
     endpoint: =Env.AZURE_AI_PROJECT_ENDPOINT

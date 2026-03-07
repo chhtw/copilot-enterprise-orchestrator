@@ -50,6 +50,7 @@ class Assumption(BaseModel):
 
 class Spec(BaseModel):
     """Orchestrator normalize 後的標準規格 — 單一真相 (spec.json)。"""
+    preferred_language: str = Field(default="zh-TW", description="使用者偏好語言/locale")
     project_name: str = Field(default="unnamed-project", description="專案名稱")
     region: str = Field(default="eastasia", description="Azure region")
     environment_count: int = Field(default=1, ge=1, description="要佈建幾個環境 (dev/stg/prod)")
@@ -67,7 +68,7 @@ class Spec(BaseModel):
     architecture_details: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Architecture-Clarification-Agent 澄清後的架構細節 "
+            "Azure-Architecture-Clarification-Agent 澄清後的架構細節 "
             "（core_services, security, network, compliance, availability, monitoring 等）"
         ),
     )
@@ -136,20 +137,28 @@ class ResourceManifest(BaseModel):
 # Agent Outputs
 # ---------------------------------------------------------------------------
 class TerraformOutput(BaseModel):
-    """Azure-Terraform-Architect-Agent 的輸出。"""
+    """Azure-Terraform-Generation-Agent 的輸出。"""
     main_tf: str = Field(default="", description="main.tf 內容")
     variables_tf: str = Field(default="", description="variables.tf 內容")
     outputs_tf: str = Field(default="", description="outputs.tf 內容")
     locals_tf: str = Field(default="", description="locals.tf 內容")
     versions_tf: str = Field(default="", description="versions.tf 內容")
     providers_tf: str = Field(default="", description="providers.tf 內容")
+    terragrunt_root_hcl: str = Field(default="", description="根目錄 terragrunt.hcl")
+    terragrunt_dev_hcl: str = Field(default="", description="/envs/dev/terragrunt.hcl")
+    terragrunt_prod_hcl: str = Field(default="", description="/envs/prod/terragrunt.hcl")
+    readme_md: str = Field(default="", description="README.md 完整內容")
+    test_files: dict[str, str] = Field(
+        default_factory=dict,
+        description="測試檔案: key=檔名(如 unit_basic.tftest.hcl), value=內容",
+    )
     resource_manifest: ResourceManifest = Field(default_factory=ResourceManifest)
     status: StepStatus = StepStatus.SUCCESS
     error: str = ""
 
 
 class DiagramOutput(BaseModel):
-    """DaC-Dagrams-Mingrammer agent 的輸出。"""
+    """Azure-Diagram-Generation-Agent 的輸出。"""
     diagram_py: str = Field(default="", description="diagram.py 內容")
     diagram_image: bytes = Field(default=b"", description="diagram.png/svg 二進位")
     diagram_image_ext: str = Field(default="png", description="png or svg")
@@ -162,7 +171,7 @@ class DiagramOutput(BaseModel):
     error: str = ""
 
 
-class CostLineItem(BaseModel):
+class PricingLineItem(BaseModel):
     """Azure Calculator 成本結構中的單一 line-item。"""
     resource_type: str = Field(..., description="e.g. azurerm_virtual_machine")
     name: str = Field(default="", description="Terraform resource name")
@@ -178,9 +187,9 @@ class CostLineItem(BaseModel):
     notes: str = Field(default="", description="備註")
 
 
-class CostStructureOutput(BaseModel):
-    """Agent-AzureCalculator 的輸出 — 架構轉換為 Azure Calculator 成本結構（Step 3a）。"""
-    line_items: list[CostLineItem] = Field(default_factory=list, description="逐項資源成本結構")
+class PricingStructureOutput(BaseModel):
+    """Azure-Pricing-Structure-Agent 的輸出 — 架構轉換為 Azure Calculator 價格結構（Step 7B）。"""
+    line_items: list[PricingLineItem] = Field(default_factory=list, description="逐項資源成本結構")
     currency: str = Field(default="USD", description="幣別")
     commitment: str = Field(default="PAYG", description="承諾類型")
     region: str = Field(default="", description="主要 region")
@@ -193,8 +202,8 @@ class CostStructureOutput(BaseModel):
         return self.model_dump_json(indent=2)
 
 
-class CostOutput(BaseModel):
-    """Agent-AzureCalculator-BrowserAuto 的輸出 — Browser Automation 操作 Azure Calculator 的最終結果（Step 3b）。"""
+class PricingOutput(BaseModel):
+    """Azure-Pricing-Browser-Agent 的輸出 — Browser Automation 操作 Azure Calculator 的最終結果（Step 8）。"""
     estimate_xlsx: bytes = Field(default=b"", description="estimate.xlsx 二進位")
     calculator_share_url: str = Field(default="", description="Azure Calculator share link")
     monthly_estimate_usd: float = Field(default=0.0, ge=0, description="總計月費 (USD)")
@@ -212,6 +221,7 @@ class AgentQuestion(BaseModel):
     question_text: str = Field(..., description="Agent 提出的問題文字")
     turn: int = Field(default=1, ge=1, description="目前對話輪次")
     hint: str = Field(default="", description="提示文字（例如選項說明）")
+    preferred_language: str = Field(default="zh-TW", description="本次 session 使用語言")
 
 
 class AgentAnswer(BaseModel):

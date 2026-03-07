@@ -27,14 +27,16 @@ from azure.ai.projects.aio import AIProjectClient
 from opentelemetry import trace as _otel_trace
 
 from .contracts import (
-    CostLineItem,
-    CostOutput,
-    CostStructureOutput,
+    PricingLineItem,
+    PricingOutput,
+    PricingStructureOutput,
     DiagramOutput,
     ResourceManifest,
     StepStatus,
     TerraformOutput,
 )
+from .i18n import extract_language_from_spec_json, human_language_instruction
+from .repair_feedback import build_diagram_repair_payload, build_terraform_repair_payload
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +50,11 @@ PROJECT_ENDPOINT = os.getenv(
     "AZURE_AI_PROJECT_ENDPOINT",
     "https://aif-ch-cht-ccoe-ai-agent.services.ai.azure.com/api/projects/ArchitectAgent",
 )
-CLARIFICATION_AGENT = os.getenv("CLARIFICATION_AGENT_NAME", "Architecture-Clarification-Agent")
-TERRAFORM_AGENT = os.getenv("TERRAFORM_AGENT_NAME", "Azure-Terraform-Architect-Agent")
-DIAGRAM_AGENT = os.getenv("DIAGRAM_AGENT_NAME", "DaC-Dagrams-Mingrammer")
-COST_AGENT = os.getenv("COST_AGENT_NAME", "Agent-AzureCalculator")
-COST_BROWSER_AGENT = os.getenv("COST_BROWSER_AGENT_NAME", "Agent-AzureCalculator-BrowserAuto")
+ARCHITECTURE_AGENT = os.getenv("ARCHITECTURE_AGENT_NAME", "Azure-Architecture-Clarification-Agent")
+TERRAFORM_AGENT = os.getenv("TERRAFORM_AGENT_NAME", "Azure-Terraform-Generation-Agent")
+DIAGRAM_AGENT = os.getenv("DIAGRAM_AGENT_NAME", "Azure-Diagram-Generation-Agent")
+PRICING_STRUCTURE_AGENT = os.getenv("PRICING_STRUCTURE_AGENT_NAME", "Azure-Pricing-Structure-Agent")
+PRICING_BROWSER_AGENT = os.getenv("PRICING_BROWSER_AGENT_NAME", "Azure-Pricing-Browser-Agent")
 
 MAX_RETRIES = int(os.getenv("AGENT_MAX_RETRIES", "2"))
 RETRY_DELAY = float(os.getenv("AGENT_RETRY_DELAY", "5.0"))
@@ -74,6 +76,9 @@ _SUPPORTED_TOOL_TYPES = {"web_search_preview", "code_interpreter", "browser_auto
 # YAML declarative agent 目錄
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "prompts"
 
+# Agent Skills 目錄
+_SKILLS_DIR = Path(__file__).resolve().parent.parent.parent / "skills"
+
 # YAML tool kind → Responses API tool type 對應
 _YAML_KIND_TO_TOOL_TYPE: dict[str, str] = {
     "WebSearch": "web_search_preview",
@@ -89,6 +94,51 @@ _MODEL_TOOL_EXCLUSIONS: dict[str, set[str]] = {
     "gpt-5.1-codex-max": {"code_interpreter"},
     "gpt-5.3-codex": {"code_interpreter"},
 }
+
+
+# ---------------------------------------------------------------------------
+# Skill Loader (progressive disclosure)
+# ---------------------------------------------------------------------------
+_skill_cache: dict[str, str] = {}
+
+
+def _load_skill(skill_path: str) -> str:
+    """
+    讀取 skill markdown 檔案（去掉 YAML frontmatter）並快取。
+
+    Args:
+        skill_path: 相對於 _SKILLS_DIR 的路徑，例如 "terraform/terraform-style-guide.md"
+
+    Returns:
+        Skill body (markdown)，去掉 YAML frontmatter 後的純內容。
+        若檔案不存在，回傳空字串並 log warning。
+    """
+    if skill_path in _skill_cache:
+        return _skill_cache[skill_path]
+
+    full_path = _SKILLS_DIR / skill_path
+    if not full_path.exists():
+        logger.warning("[Skills] Skill file not found: %s", full_path)
+        _skill_cache[skill_path] = ""
+        return ""
+
+    try:
+        raw = full_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        logger.warning("[Skills] Failed to read %s: %s", full_path, exc)
+        _skill_cache[skill_path] = ""
+        return ""
+
+    # Strip YAML frontmatter (delimited by ---)
+    body = raw
+    if body.startswith("---"):
+        end = body.find("---", 3)
+        if end != -1:
+            body = body[end + 3:].lstrip("\n")
+
+    _skill_cache[skill_path] = body
+    logger.info("[Skills] Loaded skill %s (%d chars)", skill_path, len(body))
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +159,46 @@ def _to_plain_dict(obj: Any) -> Any:
     if hasattr(obj, "items"):  # MutableMapping-like
         return {k: _to_plain_dict(v) for k, v in obj.items()}
     return obj
+
+
+async def _get_latest_agent_definition(client: AIProjectClient, agent_name: str) -> dict[str, Any]:
+    """
+    穩健取得 agent 最新 version 的 definition。
+
+    優先使用既有 `versions.latest.definition` shape；若服務回傳已偏向 2.x version API，
+    則退回 `get_version()` / `list_versions()`。
+    """
+    agent = await client.agents.get(agent_name)
+    agent_dict = _to_plain_dict(agent)
+
+    latest = ((agent_dict.get("versions") or {}).get("latest") or {}) if isinstance(agent_dict, dict) else {}
+    if isinstance(latest, dict):
+        definition = latest.get("definition")
+        if isinstance(definition, dict):
+            return definition
+
+    candidate_version = None
+    if isinstance(agent_dict, dict):
+        candidate_version = (
+            agent_dict.get("latest_version")
+            or agent_dict.get("version")
+            or agent_dict.get("latestVersion")
+        )
+
+    if candidate_version:
+        version_obj = await client.agents.get_version(agent_name, str(candidate_version))
+        version_dict = _to_plain_dict(version_obj)
+        definition = version_dict.get("definition") if isinstance(version_dict, dict) else None
+        if isinstance(definition, dict):
+            return definition
+
+    async for version_obj in client.agents.list_versions(agent_name, limit=1, order="desc"):
+        version_dict = _to_plain_dict(version_obj)
+        definition = version_dict.get("definition") if isinstance(version_dict, dict) else None
+        if isinstance(definition, dict):
+            return definition
+
+    raise ValueError(f"Unable to resolve latest definition for agent: {agent_name}")
 
 
 @dataclass
@@ -157,7 +247,7 @@ def _load_agent_def_from_yaml(agent_name: str) -> _AgentDef | None:
         return None
 
     model_cfg = doc.get("model", {})
-    model = model_cfg.get("id", "gpt-5.2") if isinstance(model_cfg, dict) else "gpt-5.2"
+    model = model_cfg.get("id", "gpt-5.4") if isinstance(model_cfg, dict) else "gpt-5.4"
     instructions = doc.get("instructions", "") or ""
 
     # 轉換 YAML tools → Responses API tools
@@ -211,10 +301,9 @@ async def _get_agent_def(client: AIProjectClient, agent_name: str) -> _AgentDef:
 
     # --- Fallback: Foundry API ---
     logger.info("[Foundry] YAML not found for %s, falling back to Foundry API", agent_name)
-    agent = await client.agents.get(agent_name)
-    defn = agent["versions"]["latest"]["definition"]
+    defn = await _get_latest_agent_definition(client, agent_name)
 
-    model = defn.get("model") or "gpt-5.2"
+    model = defn.get("model") or "gpt-5.4"
     instructions = defn.get("instructions") or ""
 
     raw_tools: list = defn.get("tools") or []
@@ -267,9 +356,9 @@ async def _invoke_foundry_agent(
     """
     # 依 agent 決定預設 timeout
     if timeout is None:
-        if agent_name == COST_BROWSER_AGENT:
+        if agent_name == PRICING_BROWSER_AGENT:
             timeout = COST_BROWSER_TIMEOUT
-        elif agent_name == COST_AGENT:
+        elif agent_name == PRICING_STRUCTURE_AGENT:
             timeout = COST_STRUCTURE_TIMEOUT
         elif agent_name == DIAGRAM_AGENT:
             timeout = DIAGRAM_AGENT_TIMEOUT
@@ -409,7 +498,21 @@ invoke_agent_raw = _invoke_foundry_agent
 # then sends user answers directly in subsequent turns)
 # ---------------------------------------------------------------------------
 def build_terraform_prompt(spec_json: str, approved_resource_manifest_json: str) -> str:
+    language_instruction = human_language_instruction(extract_language_from_spec_json(spec_json))
+    # ── Progressive disclosure: 動態載入 Terraform skills ──
+    skill_sections: list[str] = []
+    for skill_file, label in [
+        ("terraform/terraform-style-guide.md", "Terraform Style Guide"),
+        ("terraform/azure-verified-modules.md", "Azure Verified Modules (AVM) Guide"),
+        ("terraform/terraform-test.md", "Terraform Test Guide"),
+    ]:
+        body = _load_skill(skill_file)
+        if body:
+            skill_sections.append(f"\n\n===== SKILL: {label} =====\n{body}")
+    skills_block = "".join(skill_sections)
+
     return (
+        f"【語言規則】{language_instruction}\n\n"
         "【角色】你是資深 Azure Terraform/Terragrunt 架構師與 IaC Reviewer。\n\n"
         "【任務】根據 spec.json 與已核准的架構資源清單（approved_resource_manifest.json），"
         "輸出「可直接落地」的 Terraform 專案，嚴格遵循 AVM only、全 Private、"
@@ -435,12 +538,22 @@ def build_terraform_prompt(spec_json: str, approved_resource_manifest_json: str)
         "5. Tags + Naming（必做）：使用 locals 集中管理；命名格式 {env}-{project}-{service}-{region}。\n"
         "6. Terragrunt multi-env（必做）：結構包含 /envs/dev 與 /envs/prod。\n"
         "   - /src/workload/versions.tf 是唯一的 required_version 與 required_providers 宣告。\n"
-        "   - terragrunt generate 僅允許產生 backend.tf（remote state），避免重複宣告。\n\n"
+        "   - terragrunt generate 僅允許產生 backend.tf（remote state），避免重複宣告。\n"
+        "7. Terraform Test（必做）：\n"
+        "   - 必須在 /src/workload/tests/ 目錄下產生 .tftest.hcl 測試檔案。\n"
+        "   - 至少包含：unit_basic.tftest.hcl（plan-only 基本驗證）和 unit_variables.tftest.hcl（變數驗證）。\n"
+        "   - 測試須覆蓋：naming convention、tags、private endpoint、variable validation。\n\n"
+        "【Runtime 寫檔位置】\n"
+        "- Orchestrator 會將你回傳的檔案內容統一寫入 OUTPUT_DIR（預設 ./out）底下。\n"
+        "- Terraform 實際落地路徑為：./out/terraform/*.tf、./out/terraform/tests/*.tftest.hcl、./out/terraform/README.md。\n"
+        "- resource_manifest 會寫入 ./out/resource_manifest.json。\n\n"
         "【必須輸出的檔案結構】\n"
         "/terragrunt.hcl\n"
         "/envs/dev/terragrunt.hcl, /envs/prod/terragrunt.hcl\n"
         "/src/workload/versions.tf, providers.tf, main.tf, variables.tf, locals.tf, outputs.tf\n"
         "/src/workload/terraform.tfvars.example\n"
+        "/src/workload/tests/unit_basic.tftest.hcl\n"
+        "/src/workload/tests/unit_variables.tftest.hcl\n"
         "/README.md（含架構摘要、部署說明、AVM 清單、全 private 設計、RBAC、Tags/Naming）\n\n"
         "【輸出格式 — JSON（MAF 工作流程必要）】\n"
         "你的整個回應必須是一個 JSON 物件（或以 ```json 包住），包含以下 key：\n"
@@ -454,6 +567,7 @@ def build_terraform_prompt(spec_json: str, approved_resource_manifest_json: str)
         '- "terragrunt_dev_hcl": /envs/dev/terragrunt.hcl（string）\n'
         '- "terragrunt_prod_hcl": /envs/prod/terragrunt.hcl（string）\n'
         '- "readme_md": README.md 完整內容，含 Version Evidence、部署說明（string）\n'
+        '- "test_files": JSON object，key=檔名(如 "unit_basic.tftest.hcl")，value=檔案內容（string）\n'
         '- "resource_manifest": JSON object（非 string）\n'
         "  包含 project_name, resources[], terraform_version, provider_version；\n"
         "  每個 resource entry: resource_type, name, display_name, sku, region, properties。\n\n"
@@ -462,7 +576,8 @@ def build_terraform_prompt(spec_json: str, approved_resource_manifest_json: str)
         "- 若 spec 與 approved_resource_manifest 衝突，以 approved_resource_manifest 為準，"
         "  並在 README notes 記錄差異。\n"
         "- Generate COMPLETE code — 不得使用 placeholder 或 TODO。\n"
-        "- 禁止輸出 Bicep / ARM / Pulumi。\n\n"
+        "- 禁止輸出 Bicep / ARM / Pulumi。\n"
+        f"{skills_block}\n\n"
         f"spec.json:\n{spec_json}\n\n"
         f"approved_resource_manifest.json:\n{approved_resource_manifest_json}"
     )
@@ -478,29 +593,49 @@ def build_terraform_fix_prompt(
     previous_locals_tf: str = "",
     previous_versions_tf: str = "",
     previous_providers_tf: str = "",
+    repair_context_json: str = "",
 ) -> str:
     """
     建構「Terraform 驗證修正」prompt，讓 Terraform Agent
     根據 terraform init/validate 的錯誤訊息修正 Terraform 程式碼。
     """
-    extra_files = ""
-    if previous_locals_tf:
-        extra_files += (
-            "--- locals.tf ---\n"
-            f"```hcl\n{previous_locals_tf}\n```\n\n"
-        )
-    if previous_versions_tf:
-        extra_files += (
-            "--- versions.tf ---\n"
-            f"```hcl\n{previous_versions_tf}\n```\n\n"
-        )
-    if previous_providers_tf:
-        extra_files += (
-            "--- providers.tf ---\n"
-            f"```hcl\n{previous_providers_tf}\n```\n\n"
-        )
+    language_instruction = human_language_instruction(extract_language_from_spec_json(spec_json))
+    # ── Progressive disclosure: 載入 style-guide + AVM skills（修正時不需 test skill）──
+    fix_skill_sections: list[str] = []
+    for skill_file, label in [
+        ("terraform/terraform-style-guide.md", "Terraform Style Guide"),
+        ("terraform/azure-verified-modules.md", "Azure Verified Modules (AVM) Guide"),
+    ]:
+        body = _load_skill(skill_file)
+        if body:
+            fix_skill_sections.append(f"\n\n===== SKILL: {label} =====\n{body}")
+    fix_skills_block = "".join(fix_skill_sections)
+
+    payload_block = build_terraform_repair_payload(
+        spec_json=spec_json,
+        approved_resource_manifest_json=approved_resource_manifest_json,
+        previous_main_tf=previous_main_tf,
+        previous_variables_tf=previous_variables_tf,
+        previous_outputs_tf=previous_outputs_tf,
+        validation_error=validation_error,
+        previous_locals_tf=previous_locals_tf,
+        previous_versions_tf=previous_versions_tf,
+        previous_providers_tf=previous_providers_tf,
+        repair_context_json=repair_context_json,
+        spec_heading="spec.json:",
+        manifest_heading="approved_resource_manifest.json:",
+        main_heading="--- main.tf ---",
+        variables_heading="--- variables.tf ---",
+        outputs_heading="--- outputs.tf ---",
+        locals_heading="--- locals.tf ---",
+        versions_heading="--- versions.tf ---",
+        providers_heading="--- providers.tf ---",
+        error_heading="【terraform init/validate 錯誤訊息】",
+        repair_context_heading="【標準化修復摘要（machine-to-machine context）】",
+    )
 
     return (
+        f"【語言規則】{language_instruction}\n\n"
         "【角色】你是資深 Azure Terraform/Terragrunt 架構師與 IaC Reviewer。\n\n"
         "【驗證修正任務】\n"
         "你先前產生的 Terraform 程式碼在本地執行 `terraform init -backend=false && terraform validate` 時失敗了。\n"
@@ -517,16 +652,11 @@ def build_terraform_fix_prompt(
         "   確保整個專案使用同一個 provider 主版本。例如：若使用 azurerm ~> 4.0，則所有 AVM module 版本也必須相容 azurerm 4.x。\n"
         "   反之若使用 azurerm ~> 3.x，則所有 AVM module 版本也必須相容 azurerm 3.x。\n"
         "   請至 https://registry.terraform.io 查找各 AVM module 與 azurerm provider 的相容版本。\n\n"
+        "【Runtime 寫檔位置】\n"
+        "- 修正後內容仍會由 Orchestrator 統一寫入 OUTPUT_DIR（預設 ./out）底下。\n"
+        "- 實際檔案位置為 ./out/terraform/ 與 ./out/resource_manifest.json。\n\n"
         "【上次產生的 Terraform 程式碼】\n\n"
-        "--- main.tf ---\n"
-        f"```hcl\n{previous_main_tf}\n```\n\n"
-        "--- variables.tf ---\n"
-        f"```hcl\n{previous_variables_tf}\n```\n\n"
-        "--- outputs.tf ---\n"
-        f"```hcl\n{previous_outputs_tf}\n```\n\n"
-        f"{extra_files}"
-        "【terraform init/validate 錯誤訊息】\n"
-        f"```\n{validation_error}\n```\n\n"
+        f"{payload_block}"
         "【輸出格式 — JSON（MAF 工作流程必要）】\n"
         "你的整個回應必須是一個 JSON 物件（或以 ```json 包住），包含以下 key：\n"
         '- "main_tf": 修正後的 main.tf 完整內容（string）\n'
@@ -540,14 +670,17 @@ def build_terraform_fix_prompt(
         "IMPORTANT:\n"
         "- 回傳 COMPLETE code — 不得使用 placeholder 或 TODO。\n"
         "- 禁止輸出 Bicep / ARM / Pulumi。\n"
-        "- approved_resource_manifest.json 仍是資源的唯一真相來源。\n\n"
+        "- approved_resource_manifest.json 仍是資源的唯一真相來源。\n"
+        f"{fix_skills_block}\n\n"
         f"spec.json:\n{spec_json}\n\n"
         f"approved_resource_manifest.json:\n{approved_resource_manifest_json}"
     )
 
 
 def build_diagram_prompt(spec_json: str, architecture_details_json: str = "{}") -> str:
+    language_instruction = human_language_instruction(extract_language_from_spec_json(spec_json))
     return (
+        f"【語言規則】{language_instruction}\n\n"
         "【角色】你是使用 Python Diagrams（mingrammer）的雲端架構圖產出專家。\n\n"
         "TASK: Generate a Python architecture diagram script using the 'diagrams' library (mingrammer).\n"
         "This is an ARCHITECTURE DIAGRAM task — NOT a pricing or cost task.\n\n"
@@ -557,6 +690,11 @@ def build_diagram_prompt(spec_json: str, architecture_details_json: str = "{}") 
         "2. 必須涵蓋 spec.json 和 architecture_details.json 中描述的所有服務與安全要求。\n"
         "3. 安全控制（HSM/Key Vault、WAF、Private Endpoint、DDoS 等）必須在圖中以獨立節點呈現，\n"
         "   並以帶標籤的連線表示 traffic flow（例如 Edge(label=\"HTTPS 443\")）。\n\n"
+        "【Runtime 寫檔位置】\n"
+        "- Orchestrator 會將你的輸出統一寫入 OUTPUT_DIR（預設 ./out）底下。\n"
+        "- `diagram_py` 會寫成 ./out/diagram.py；render log 會寫成 ./out/render_log.txt。\n"
+        "- 經本地渲染後，圖片會寫成 ./out/diagram.png 或 ./out/diagram.svg。\n"
+        "- `approved_resource_manifest` 會另外寫入 ./out/resource_manifest.json。\n\n"
         "【Azure Import Allowlist 規則（必守）】\n"
         "僅能匯入 https://diagrams.mingrammer.com/docs/nodes/azure 官方文件中有記載的類別。\n"
         "禁止使用文件未列出的類別（例如 Bastion, PrivateDnsResolver, AMPLS）。\n"
@@ -592,6 +730,10 @@ def build_diagram_regen_prompt(
     previous_diagram_py: str,
     render_error: str,
     available_classes_summary: str,
+    previous_approved_resource_manifest_json: str = "{}",
+    render_log: str = "",
+    regen_attempt: int = 1,
+    repair_context_json: str = "",
 ) -> str:
     """
     建構「渲染錯誤修正」prompt，讓 Diagram Agent 根據上次錯誤重新產生 diagram.py。
@@ -599,12 +741,37 @@ def build_diagram_regen_prompt(
     Args:
         spec_json: 原始 spec JSON
         architecture_details_json: 架構細節 JSON
-        previous_diagram_py: 上次生成且渲染失敗的 diagram.py 原始碼
+        previous_diagram_py: 最新一次渲染失敗時的 diagram.py 原始碼（可能已含 renderer auto-fix 結果）
         render_error: 渲染失敗的 stderr / error 訊息
         available_classes_summary: 可用的 diagrams.azure.* class 清單摘要
+        previous_approved_resource_manifest_json: 上游已核准的資源清單 JSON
+        render_log: renderer 的完整 render log
+        regen_attempt: 第幾次 regen
     """
+    language_instruction = human_language_instruction(extract_language_from_spec_json(spec_json))
+    payload_block = build_diagram_repair_payload(
+        spec_json=spec_json,
+        architecture_details_json=architecture_details_json,
+        previous_diagram_py=previous_diagram_py,
+        render_error=render_error,
+        render_log=render_log,
+        previous_approved_resource_manifest_json=previous_approved_resource_manifest_json,
+        available_classes_summary=available_classes_summary,
+        repair_context_json=repair_context_json,
+        spec_heading="spec.json:",
+        architecture_heading="architecture_details.json:",
+        diagram_heading="【最新失敗版本的 diagram.py】",
+        error_heading="【渲染錯誤訊息】",
+        render_log_heading="【renderer render_log】",
+        manifest_heading="【目前 approved_resource_manifest（上游契約，預設應維持不變）】",
+        classes_heading="【可用的 diagrams.azure.* 類別清單】",
+        repair_context_heading="【標準化修復摘要（machine-to-machine context）】",
+    )
     return (
+        f"【語言規則】{language_instruction}\n\n"
         "【角色】你是使用 Python Diagrams（mingrammer）的雲端架構圖產出專家。\n\n"
+        f"【執行脈絡】這是 Orchestrator 與本地 renderer 的第 {regen_attempt} 次修復回合。\n"
+        "下游 renderer 已實際執行過 diagram.py；你現在收到的是『真實執行結果』，必須以上游需求 + 下游錯誤回饋共同修正。\n\n"
         "【渲染錯誤修正任務】\n"
         "你先前產生的 diagram.py 在本地渲染時失敗了。\n"
         "請根據以下錯誤訊息與可用類別清單，修正並重新產生完整的 diagram.py。\n\n"
@@ -612,28 +779,34 @@ def build_diagram_regen_prompt(
         "1. 只使用下方「可用類別清單」中列出的類別，不要猜測或編造不存在的類別。\n"
         "2. 如果原本使用的類別不在清單中，請選用最接近的替代類別，並在 assumptions 中說明。\n"
         "3. 確保所有 import 語句正確，模組路徑與類別名稱完全匹配。\n"
-        "4. 保持原本的架構邏輯與佈局不變，只修正導致錯誤的部分。\n\n"
-        "【上次渲染失敗的 diagram.py】\n"
-        f"```python\n{previous_diagram_py}\n```\n\n"
-        "【渲染錯誤訊息】\n"
-        f"```\n{render_error}\n```\n\n"
-        "【可用的 diagrams.azure.* 類別清單】\n"
-        f"```\n{available_classes_summary}\n```\n\n"
+        "4. 保持原本的架構邏輯與佈局不變，只修正導致錯誤的部分。\n"
+        "5. 絕對不要追問使用者；這一輪是 machine-to-machine 修復。\n"
+        "6. approved_resource_manifest 是 Terraform / Pricing 的上游契約。若資源拓樸沒有改變，必須原樣保留。\n"
+        "7. 你必須以『最新失敗版本』的 diagram.py 為基礎修正，而不是回到更舊版本。\n"
+        "8. render_log 可能包含 renderer 已做過的 auto-fix 與失敗脈絡；請避免重複犯同一類錯誤。\n\n"
+        "【Runtime 寫檔位置】\n"
+        "- 修正版仍會由 Orchestrator 統一寫入 OUTPUT_DIR（預設 ./out）底下。\n"
+        "- 實際檔案位置為 ./out/diagram.py、./out/render_log.txt、./out/diagram.png 或 ./out/diagram.svg。\n\n"
+        f"{payload_block}"
         "You MUST return a valid JSON object (or wrapped in ```json block) with these keys:\n"
         '- "diagram_py": the COMPLETE corrected Python script (not a diff)\n'
-        '- "render_log": short description of what was fixed\n'
+        '- "render_log": short description of what was fixed and why the new version should render successfully\n'
         '- "assumptions": list of substitutions or changes made\n'
         '- "approved_resource_manifest": same resource manifest as before '
         "(update only if resource names changed)\n"
         '- "diagram_image_base64": empty string ""\n\n'
+        "If the failure was caused by wrong imports or undefined names, correct the code directly.\n"
+        "If the failure was caused by invalid graph construction, keep the same architecture but simplify the offending edges/clusters into valid diagrams syntax.\n\n"
         f"spec.json:\n{spec_json}\n\n"
         f"architecture_details.json:\n{architecture_details_json}"
     )
 
 
 def build_architecture_clarification_prompt(spec_json: str) -> str:
-    """Step 0c: 呼叫 Architecture-Clarification-Agent 澄清架構需求細節。"""
+    """Step 3: 呼叫 Azure-Architecture-Clarification-Agent 澄清架構需求細節。"""
+    language_instruction = human_language_instruction(extract_language_from_spec_json(spec_json))
     return (
+        f"【語言規則】{language_instruction}\n\n"
         "【角色】你是雲端架構師助理，負責在架構設計前與使用者確認架構細節，確保需求完整。\n\n"
         "【任務】\n"
         "分析使用者提供的原始需求（spec.json 中的 raw_input 與 notes 欄位），"
@@ -653,9 +826,11 @@ def build_architecture_clarification_prompt(spec_json: str) -> str:
         "8. 高可用/備援：需要多 region（Active-Active / Active-Passive）？目標 RTO/RPO？\n"
         "9. 監控與可觀測性：Application Insights? Log Analytics Workspace? Azure Monitor Alerts?\n"
         "10. 其他特殊需求：例如電商的 API Management、訂單服務、支付整合等。\n\n"
+        "【Runtime 寫檔位置】\n"
+        "- 你回傳的 `architecture_details` 會由 Orchestrator 合併回 spec.json，並統一寫入 OUTPUT_DIR（預設 ./out）下的 ./out/spec.json。\n\n"
         "【行為指示】\n"
         "- 若使用者的 raw_input / notes 已清楚涵蓋上述大多數面向，請直接輸出最終 JSON。\n"
-        "- 若資訊不足，請以繁體中文提出 3-5 個最關鍵的確認問題（純文字，不含 JSON），"
+        "- 若資訊不足，請使用 spec.json.preferred_language 指定的語言提出 3-5 個最關鍵的確認問題（純文字，不含 JSON），"
         "  每題附上推薦預設值，等使用者回答後再輸出 JSON。\n"
         "- 問題要具體，例如：\n"
         "  「您需要 Azure Key Vault 的 HSM 保護嗎？"
@@ -690,9 +865,11 @@ def build_architecture_clarification_prompt(spec_json: str) -> str:
     )
 
 
-def build_cost_structure_prompt(spec_json: str, resource_manifest_json: str) -> str:
-    """Step 3a: 將架構轉換為 Azure Calculator 成本結構（不需要 browser automation）。"""
+def build_pricing_structure_prompt(spec_json: str, resource_manifest_json: str) -> str:
+    """Step 7B: 將架構轉換為 Azure Calculator 價格結構（不需要 browser automation）。"""
+    language_instruction = human_language_instruction(extract_language_from_spec_json(spec_json))
     return (
+        f"Language rule: {language_instruction}\n\n"
         "TASK: Convert the resource manifest into a detailed Azure Pricing Calculator cost structure.\n\n"
         "For EACH resource in the manifest, produce a line-item with ALL of the following fields:\n"
         "- resource_type: Terraform resource type (e.g. azurerm_virtual_machine)\n"
@@ -717,10 +894,12 @@ def build_cost_structure_prompt(spec_json: str, resource_manifest_json: str) -> 
         '- "region": primary region\n'
         '- "total_estimated_monthly_usd": sum of all line-item costs\n'
         '- "notes": overall assumptions or caveats\n\n'
+        "Runtime persistence note:\n"
+        "- Orchestrator will save your final JSON to OUTPUT_DIR (default ./out) as ./out/pricing_structure.json.\n\n"
         "IMPORTANT:\n"
         "- Do NOT use browser automation. Use your knowledge of Azure pricing.\n"
         "- If critical pricing parameters (SKU, region, usage) are missing for any resource, "
-        "ask the user in PLAIN TEXT (no JSON) listing each missing field with a proposed default value. "
+        "ask the user in PLAIN TEXT using the preferred language from spec.json (no JSON) listing each missing field with a proposed default value. "
         "If the user confirms or provides values, output the final JSON. "
         "If all parameters are available, output the final JSON directly.\n"
         "- If a resource has no direct cost, include it with estimated_monthly_usd=0.\n"
@@ -730,15 +909,19 @@ def build_cost_structure_prompt(spec_json: str, resource_manifest_json: str) -> 
     )
 
 
-def build_cost_browser_prompt(cost_structure_json: str) -> str:
-    """Step 3b: 使用 Browser Automation 操作 Azure Pricing Calculator。"""
+def build_pricing_browser_prompt(pricing_structure_json: str) -> str:
+    """Step 8: 使用 Browser Automation 操作 Azure Pricing Calculator。"""
     return (
         "TASK: Use Browser Automation to create an Azure Pricing Calculator estimate.\n\n"
-        "You are given a cost_structure.json containing detailed line-items with "
+        "You are given a pricing_structure.json containing detailed line-items with "
         "product_id, sku, region, quantity, pricing_tier for each Azure resource.\n\n"
+        "Runtime persistence note:\n"
+        "- Orchestrator will save your results under OUTPUT_DIR (default ./out).\n"
+        "- The share URL will be written to ./out/calculator_share_url.txt.\n"
+        "- The exported workbook will be written to ./out/estimate.xlsx.\n\n"
         "Steps:\n"
         "1. Navigate to https://azure.microsoft.com/en-us/pricing/calculator/\n"
-        "2. For EACH line-item in the cost structure:\n"
+        "2. For EACH line-item in the pricing structure:\n"
         "   a. Search for the product using product_id or display_name\n"
         "   b. Add it to the estimate\n"
         "   c. Configure: region, SKU/tier, pricing_tier (PAYG/RI), quantity\n"
@@ -756,7 +939,7 @@ def build_cost_browser_prompt(cost_structure_json: str) -> str:
         "- Do NOT ask clarifying questions. Work with the data provided.\n"
         "- If browser automation fails for a specific resource, skip it and note in cost_breakdown.\n"
         "- The share URL is critical — make sure to obtain it.\n\n"
-        f"cost_structure.json:\n{cost_structure_json}"
+        f"pricing_structure.json:\n{pricing_structure_json}"
     )
 
 
@@ -775,6 +958,18 @@ def parse_terraform_output(raw_text: str) -> TerraformOutput:
     if not isinstance(manifest_data, dict):
         manifest_data = {}
     manifest = ResourceManifest(**manifest_data)
+
+    # Parse test_files — expect dict[str, str]; gracefully handle str or bad data
+    raw_test = data.get("test_files", {})
+    if isinstance(raw_test, str):
+        try:
+            raw_test = json.loads(raw_test)
+        except (json.JSONDecodeError, TypeError):
+            raw_test = {}
+    if not isinstance(raw_test, dict):
+        raw_test = {}
+    test_files: dict[str, str] = {k: str(v) for k, v in raw_test.items()}
+
     return TerraformOutput(
         main_tf=data.get("main_tf", ""),
         variables_tf=data.get("variables_tf", ""),
@@ -782,6 +977,11 @@ def parse_terraform_output(raw_text: str) -> TerraformOutput:
         locals_tf=data.get("locals_tf", ""),
         versions_tf=data.get("versions_tf", ""),
         providers_tf=data.get("providers_tf", ""),
+        terragrunt_root_hcl=data.get("terragrunt_root_hcl", ""),
+        terragrunt_dev_hcl=data.get("terragrunt_dev_hcl", ""),
+        terragrunt_prod_hcl=data.get("terragrunt_prod_hcl", ""),
+        readme_md=data.get("readme_md", ""),
+        test_files=test_files,
         resource_manifest=manifest,
         status=StepStatus.SUCCESS,
     )
@@ -796,14 +996,79 @@ def _unescape_code(code: str) -> str:
     """
     if not code:
         return code
-    # 只在內容看起來被壓成一行（含字面 \n）時才做替換
-    if "\\n" in code:
-        code = code.replace("\\n", "\n")
-    if "\\t" in code:
-        code = code.replace("\\t", "\t")
-    if '\\"' in code:
-        code = code.replace('\\"', '"')
-    return code
+    # 若 json.loads 後已保留真正的程式碼換行，代表 code 已是多行 Python。
+    # 此時若再把字面 \n 轉成真正換行，會把 Python 字串常值中的跳脫序列
+    # 直接展開，導致例如 "DDoS Protection\\nStandard" 被寫壞成跨行字串。
+    if "\n" in code or "\r" in code:
+        return code
+
+    result: list[str] = []
+    i = 0
+    in_string: str | None = None
+    triple_quoted = False
+    escaped = False
+
+    while i < len(code):
+        if in_string is not None:
+            if triple_quoted and code.startswith(in_string * 3, i):
+                result.append(in_string * 3)
+                i += 3
+                in_string = None
+                triple_quoted = False
+                escaped = False
+                continue
+
+            ch = code[i]
+            result.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif not triple_quoted and ch == in_string:
+                in_string = None
+            i += 1
+            continue
+
+        if code.startswith("'''", i) or code.startswith('"""', i):
+            quote = code[i]
+            result.append(quote * 3)
+            i += 3
+            in_string = quote
+            triple_quoted = True
+            escaped = False
+            continue
+
+        ch = code[i]
+        if ch in ("'", '"'):
+            result.append(ch)
+            i += 1
+            in_string = ch
+            triple_quoted = False
+            escaped = False
+            continue
+
+        if ch == "\\" and i + 1 < len(code):
+            nxt = code[i + 1]
+            if nxt == "n":
+                result.append("\n")
+                i += 2
+                continue
+            if nxt == "t":
+                result.append("\t")
+                i += 2
+                continue
+            if nxt == "r":
+                i += 2
+                continue
+            if nxt in {'"', "'"}:
+                result.append(nxt)
+                i += 2
+                continue
+
+        result.append(ch)
+        i += 1
+
+    return "".join(result)
 
 
 def parse_diagram_output(raw_text: str) -> DiagramOutput:
@@ -836,17 +1101,17 @@ def parse_diagram_output(raw_text: str) -> DiagramOutput:
     )
 
 
-def parse_cost_structure_output(raw_text: str) -> CostStructureOutput:
-    """Parse raw agent text → CostStructureOutput (Step 3a)."""
+def parse_pricing_structure_output(raw_text: str) -> PricingStructureOutput:
+    """Parse raw agent text → PricingStructureOutput (Step 7B)."""
     data = _extract_json(raw_text)
     raw_items = data.get("line_items", [])
     line_items = []
     for item in raw_items:
         if isinstance(item, dict):
-            line_items.append(CostLineItem(**{
-                k: v for k, v in item.items() if k in CostLineItem.model_fields
+            line_items.append(PricingLineItem(**{
+                k: v for k, v in item.items() if k in PricingLineItem.model_fields
             }))
-    return CostStructureOutput(
+    return PricingStructureOutput(
         line_items=line_items,
         currency=data.get("currency", "USD"),
         commitment=data.get("commitment", "PAYG"),
@@ -857,8 +1122,8 @@ def parse_cost_structure_output(raw_text: str) -> CostStructureOutput:
     )
 
 
-def parse_cost_output(raw_text: str) -> CostOutput:
-    """Parse raw agent text → CostOutput (Step 3b — browser automation)."""
+def parse_pricing_output(raw_text: str) -> PricingOutput:
+    """Parse raw agent text → PricingOutput (Step 8 — browser automation)."""
     data = _extract_json(raw_text)
 
     # Check for error field from browser automation
@@ -883,7 +1148,7 @@ def parse_cost_output(raw_text: str) -> CostOutput:
     else:
         status = StepStatus.SUCCESS
 
-    return CostOutput(
+    return PricingOutput(
         estimate_xlsx=xlsx_bytes,
         calculator_share_url=share_url,
         monthly_estimate_usd=monthly,
@@ -898,7 +1163,7 @@ def parse_cost_output(raw_text: str) -> CostOutput:
 # ---------------------------------------------------------------------------
 async def invoke_terraform_agent(spec_json: str) -> TerraformOutput:
     """
-    呼叫 Azure-Terraform-Architect-Agent（單次呼叫 — 無 multi-turn）。
+    呼叫 Azure-Terraform-Generation-Agent（單次呼叫 — 無 multi-turn）。
     Multi-turn 版本請使用 executor 搭配 invoke_agent_raw + parse_terraform_output。
     """
     try:
@@ -922,7 +1187,7 @@ async def invoke_diagram_agent(
     resource_manifest_json: str,
 ) -> DiagramOutput:
     """
-    呼叫 DaC-Dagrams-Mingrammer（單次呼叫 — 無 multi-turn）。
+    呼叫 Azure-Diagram-Generation-Agent（單次呼叫 — 無 multi-turn）。
     """
     try:
         prompt = build_diagram_prompt(spec_json)
@@ -938,45 +1203,45 @@ async def invoke_diagram_agent(
 
 
 # ---------------------------------------------------------------------------
-# Step 3a: Cost Structure Agent (convenience wrapper)
+# Step 7B: Pricing Structure Agent (convenience wrapper)
 # ---------------------------------------------------------------------------
-async def invoke_cost_structure_agent(
+async def invoke_pricing_structure_agent(
     spec_json: str,
     resource_manifest_json: str,
-) -> CostStructureOutput:
+) -> PricingStructureOutput:
     """
-    呼叫 Agent-AzureCalculator 做架構→成本結構轉換（單次呼叫 — 無 multi-turn）。
+    呼叫 Azure-Pricing-Structure-Agent 做架構→成本結構轉換（單次呼叫 — 無 multi-turn）。
     """
     try:
-        prompt = build_cost_structure_prompt(spec_json, resource_manifest_json)
-        raw, _ = await _invoke_foundry_agent(COST_AGENT, prompt, retries=MAX_RETRIES)
+        prompt = build_pricing_structure_prompt(spec_json, resource_manifest_json)
+        raw, _ = await _invoke_foundry_agent(PRICING_STRUCTURE_AGENT, prompt, retries=MAX_RETRIES)
         logger.info("[CostStructure] Raw response (first 500 chars): %s", raw[:500])
-        return parse_cost_structure_output(raw)
+        return parse_pricing_structure_output(raw)
     except Exception as exc:
         logger.error("[CostStructure] Failed: %s", exc)
-        return CostStructureOutput(
+        return PricingStructureOutput(
             status=StepStatus.FAILED,
             error=str(exc),
         )
 
 
 # ---------------------------------------------------------------------------
-# Step 3b: Cost Browser Agent (convenience wrapper)
+# Step 8: Pricing Browser Agent (convenience wrapper)
 # ---------------------------------------------------------------------------
-async def invoke_cost_browser_agent(
-    cost_structure_json: str,
-) -> CostOutput:
+async def invoke_pricing_browser_agent(
+    pricing_structure_json: str,
+) -> PricingOutput:
     """
-    呼叫 Agent-AzureCalculator-BrowserAuto 使用 browser automation 操作 Azure Calculator（單次呼叫）。
+    呼叫 Azure-Pricing-Browser-Agent 使用 browser automation 操作 Azure Calculator（單次呼叫）。
     """
     try:
-        prompt = build_cost_browser_prompt(cost_structure_json)
-        raw, _ = await _invoke_foundry_agent(COST_BROWSER_AGENT, prompt, retries=MAX_RETRIES)
+        prompt = build_pricing_browser_prompt(pricing_structure_json)
+        raw, _ = await _invoke_foundry_agent(PRICING_BROWSER_AGENT, prompt, retries=MAX_RETRIES)
         logger.info("[CostBrowser] Raw response (first 500 chars): %s", raw[:500])
-        return parse_cost_output(raw)
+        return parse_pricing_output(raw)
     except Exception as exc:
         logger.error("[CostBrowser] Failed: %s", exc)
-        return CostOutput(
+        return PricingOutput(
             status=StepStatus.FAILED,
             error=str(exc),
         )

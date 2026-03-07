@@ -3,13 +3,13 @@ agent_sync.py — 同步 Foundry Agent 定義 ↔ 本地 YAML 檔案。
 
 用途：
   - pull：從 Microsoft Foundry 下載 agent 定義 → 寫入 prompts/{agent_name}.yaml
-  - push：讀取 prompts/{agent_name}.yaml → 建立或更新 Foundry agent（draft → publish）
+    - push：讀取 prompts/{agent_name}.yaml → 在 Foundry 建立新的 agent version
 
 使用方式（CLI）：
   python -m orchestrator_app.agent_sync pull           # 拉取所有 agent
   python -m orchestrator_app.agent_sync pull AgentName  # 拉取指定 agent
   python -m orchestrator_app.agent_sync push           # 推送所有 agent
-  python -m orchestrator_app.agent_sync push AgentName --no-publish  # 只更新 draft
+    python -m orchestrator_app.agent_sync push AgentName --no-publish  # 舊旗標保留，相容模式下忽略
 
 YAML 採用 Microsoft Agent Framework declarative 格式：
   kind: Prompt
@@ -36,7 +36,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from azure.ai.projects.aio import AIProjectClient
@@ -75,11 +75,11 @@ PROJECT_ENDPOINT = os.getenv(
 
 # 所有受管 agent 名稱（與 foundry_agents.py 一致）
 MANAGED_AGENTS: list[str] = [
-    os.getenv("CLARIFICATION_AGENT_NAME", "Architecture-Clarification-Agent"),
-    os.getenv("TERRAFORM_AGENT_NAME", "Azure-Terraform-Architect-Agent"),
-    os.getenv("DIAGRAM_AGENT_NAME", "DaC-Dagrams-Mingrammer"),
-    os.getenv("COST_AGENT_NAME", "Agent-AzureCalculator"),
-    os.getenv("COST_BROWSER_AGENT_NAME", "Agent-AzureCalculator-BrowserAuto"),
+    os.getenv("ARCHITECTURE_AGENT_NAME", "Azure-Architecture-Clarification-Agent"),
+    os.getenv("TERRAFORM_AGENT_NAME", "Azure-Terraform-Generation-Agent"),
+    os.getenv("DIAGRAM_AGENT_NAME", "Azure-Diagram-Generation-Agent"),
+    os.getenv("PRICING_STRUCTURE_AGENT_NAME", "Azure-Pricing-Structure-Agent"),
+    os.getenv("PRICING_BROWSER_AGENT_NAME", "Azure-Pricing-Browser-Agent"),
 ]
 
 # prompts 目錄
@@ -112,6 +112,49 @@ def _to_plain_dict(obj: Any) -> Any:
     if hasattr(obj, "items"):
         return {k: _to_plain_dict(v) for k, v in obj.items()}
     return obj
+
+
+async def _get_latest_agent_definition(client: AIProjectClient, agent_name: str, agent: Any | None = None) -> dict[str, Any]:
+    """
+    盡可能穩健地取得 agent 最新 version 的 definition。
+
+    2.x 文件顯示 agent 管理已轉向 version-based API；不同 SDK/服務回傳 shape
+    可能同時存在：
+      1. agent["versions"]["latest"]["definition"]
+      2. agent["latest_version"] / agent["version"] → get_version(...)
+      3. list_versions(...)
+    """
+    agent_obj = agent if agent is not None else await client.agents.get(agent_name)
+    agent_dict = _to_plain_dict(agent_obj)
+
+    latest = ((agent_dict.get("versions") or {}).get("latest") or {}) if isinstance(agent_dict, dict) else {}
+    if isinstance(latest, dict):
+        definition = latest.get("definition")
+        if isinstance(definition, dict):
+            return definition
+
+    candidate_version = None
+    if isinstance(agent_dict, dict):
+        candidate_version = (
+            agent_dict.get("latest_version")
+            or agent_dict.get("version")
+            or agent_dict.get("latestVersion")
+        )
+
+    if candidate_version:
+        version_obj = await client.agents.get_version(agent_name, str(candidate_version))
+        version_dict = _to_plain_dict(version_obj)
+        definition = version_dict.get("definition") if isinstance(version_dict, dict) else None
+        if isinstance(definition, dict):
+            return definition
+
+    async for version_obj in client.agents.list_versions(agent_name, limit=1, order="desc"):
+        version_dict = _to_plain_dict(version_obj)
+        definition = version_dict.get("definition") if isinstance(version_dict, dict) else None
+        if isinstance(definition, dict):
+            return definition
+
+    raise ValueError(f"Unable to resolve latest definition for agent: {agent_name}")
 
 
 # ---------------------------------------------------------------------------
@@ -178,8 +221,8 @@ async def pull_agent_to_yaml(agent_name: str, *, overwrite: bool = False) -> Pat
             agent = await client.agents.get(agent_name)
 
             # 取得 latest version 的 definition
-            defn = agent["versions"]["latest"]["definition"]
-            model = defn.get("model") or "gpt-5.2"
+            defn = await _get_latest_agent_definition(client, agent_name, agent)
+            model = defn.get("model") or "gpt-5.4"
             instructions = defn.get("instructions") or ""
             raw_tools: list = defn.get("tools") or []
 
@@ -294,16 +337,17 @@ async def push_yaml_to_foundry(
     publish: bool = True,
 ) -> None:
     """
-    讀取 YAML 並建立或更新 Foundry agent。
+    讀取 YAML 並在 Foundry 建立新的 agent version。
 
     Args:
         agent_name: agent 名稱（須與 YAML 檔名一致）
-        publish: 是否發布（True=published, False=只更新 draft）
+        publish: 舊版 draft/publish 語意保留；在 2.x version API 中僅作相容用途。
     """
     doc = load_yaml(agent_name)
 
+    kind = doc.get("kind", "Prompt")
     model_cfg = doc.get("model", {})
-    model_id = model_cfg.get("id", "gpt-5.2")
+    model_id = model_cfg.get("id", "gpt-5.4")
     instructions = doc.get("instructions", "")
     yaml_tools = doc.get("tools", [])
     foundry_tools = _yaml_tools_to_foundry(yaml_tools)
@@ -314,10 +358,10 @@ async def push_yaml_to_foundry(
             endpoint=PROJECT_ENDPOINT,
             credential=credential,
         ) as client:
-            # 檢查 agent 是否已存在
+            # 檢查 agent 是否已存在（僅用於顯示提示；2.x 一律建立新 version）
             exists = False
             try:
-                existing = await client.agents.get(agent_name)
+                await client.agents.get(agent_name)
                 exists = True
                 logger.info("[Sync] Agent exists: %s", agent_name)
             except Exception:
@@ -325,37 +369,27 @@ async def push_yaml_to_foundry(
                 logger.info("[Sync] Agent not found, will create: %s", agent_name)
 
             definition = {
+                "kind": kind,
                 "model": model_id,
                 "instructions": instructions,
             }
             if foundry_tools:
                 definition["tools"] = foundry_tools
 
-            if exists:
-                # 更新現有 agent（draft version）
-                print(f"  📤 Updating agent: {agent_name} ...", flush=True)
-                await client.agents.update(
-                    agent_name,
-                    definition=definition,
-                )
-                print(f"  ✅ Updated draft: {agent_name}")
-            else:
-                # 建立新 agent
-                print(f"  📤 Creating agent: {agent_name} ...", flush=True)
-                await client.agents.create(
-                    name=agent_name,
-                    definition=definition,
-                )
-                print(f"  ✅ Created: {agent_name}")
+            action = "Creating first version" if not exists else "Creating new version"
+            print(f"  📤 {action}: {agent_name} ...", flush=True)
+            created = await client.agents.create_version(
+                agent_name,
+                definition=cast(Any, definition),
+            )
+            version = created.get("version", "(unknown)")
+            print(f"  ✅ Created version: {agent_name}@{version}")
 
-            # 發布 (draft → published)
-            if publish:
-                try:
-                    await client.agents.publish(agent_name)
-                    print(f"  🚀 Published: {agent_name}")
-                except Exception as pub_exc:
-                    print(f"  ⚠️  Publish failed (draft saved): {pub_exc}")
-                    logger.warning("[Sync] Publish failed for %s: %s", agent_name, pub_exc)
+            if not publish:
+                print(
+                    "  ℹ️  --no-publish 已保留為相容旗標；azure-ai-projects 2.x 改用 version API，不再區分 draft/publish。",
+                    flush=True,
+                )
 
     finally:
         await credential.close()
@@ -395,7 +429,11 @@ def _parse_args() -> argparse.Namespace:
     # push
     push_cmd = sub.add_parser("push", help="Push YAML → Foundry agents")
     push_cmd.add_argument("agent_name", nargs="?", default=None, help="Agent name (omit for all)")
-    push_cmd.add_argument("--no-publish", action="store_true", help="Only update draft, don't publish")
+    push_cmd.add_argument(
+        "--no-publish",
+        action="store_true",
+        help="Compatibility flag only; ignored with azure-ai-projects 2.x version API",
+    )
 
     return parser.parse_args()
 

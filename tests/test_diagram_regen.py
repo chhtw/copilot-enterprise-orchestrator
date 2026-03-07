@@ -30,7 +30,14 @@ from orchestrator_app.contracts import (
     StepStatus,
 )
 from orchestrator_app.diagram_renderer import get_available_azure_classes_summary
-from orchestrator_app.foundry_agents import build_diagram_regen_prompt
+from orchestrator_app.foundry_agents import build_diagram_regen_prompt, build_terraform_fix_prompt
+from orchestrator_app.repair_feedback import (
+    build_diagram_repair_payload,
+    build_repair_context_json,
+    build_terraform_repair_payload,
+    render_prompt_block,
+    render_repair_context_block,
+)
 
 
 # ======================================================================
@@ -97,9 +104,10 @@ def _make_regenerated_diag_output() -> DiagramOutput:
     )
 
 
-def _make_mock_ctx() -> AsyncMock:
+def _make_mock_ctx() -> MagicMock:
     """建立模擬 WorkflowContext。"""
-    ctx = AsyncMock()
+    ctx = MagicMock()
+    ctx.get_state = MagicMock(side_effect=KeyError)
     ctx.yield_output = AsyncMock()
     return ctx
 
@@ -142,6 +150,9 @@ class TestBuildDiagramRegenPrompt:
             previous_diagram_py='print("hello")',
             render_error="ImportError: cannot import name 'Foo'",
             available_classes_summary="diagrams.azure.compute: VM, AKS",
+            previous_approved_resource_manifest_json='{"project_name":"test","resources":[]}',
+            render_log="[Render] FAILED",
+            regen_attempt=2,
         )
         assert isinstance(prompt, str)
         # 包含關鍵區段
@@ -150,6 +161,9 @@ class TestBuildDiagramRegenPrompt:
         assert 'print("hello")' in prompt
         assert "diagrams.azure.compute" in prompt
         assert "test" in prompt
+        assert "render_log" in prompt
+        assert "approved_resource_manifest" in prompt
+        assert "第 2 次" in prompt or "Repair round: 2" in prompt
 
     def test_contains_json_instruction(self):
         """prompt 應指示回傳 JSON 格式。"""
@@ -174,6 +188,163 @@ class TestBuildDiagramRegenPrompt:
         )
         assert "Firewall" in prompt
         assert "diagrams.azure.network" in prompt
+
+    def test_includes_render_feedback_contract(self):
+        repair_context_json = build_repair_context_json(
+            repair_kind="diagram_regen",
+            attempt=3,
+            max_attempts=3,
+            upstream_agent="Azure-Diagram-Generation-Agent",
+            downstream_component="local diagram renderer",
+            failure_message="err",
+            execution_log="[Render] Attempt 1 failed",
+            contract_name="approved_resource_manifest",
+            contract_payload='{"resources":[]}',
+            latest_artifact_name="diagram.py",
+            latest_artifact_content="code",
+        )
+        prompt = build_diagram_regen_prompt(
+            spec_json="{}",
+            architecture_details_json="{}",
+            previous_diagram_py="code",
+            render_error="err",
+            available_classes_summary="classes",
+            previous_approved_resource_manifest_json='{"resources":[]}',
+            render_log="[Render] Attempt 1 failed",
+            regen_attempt=3,
+            repair_context_json=repair_context_json,
+        )
+        assert "renderer" in prompt.lower() or "downstream" in prompt.lower()
+        assert "[Render] Attempt 1 failed" in prompt
+        assert '"resources":[]' in prompt
+        assert "standardized repair context" in prompt.lower() or "標準化修復摘要" in prompt
+
+
+class TestRepairContextHelper:
+    def test_builds_structured_json_payload(self):
+        payload = build_repair_context_json(
+            repair_kind="terraform_validation_fix",
+            attempt=1,
+            max_attempts=2,
+            upstream_agent="Azure-Terraform-Generation-Agent",
+            downstream_component="terraform validate",
+            failure_message="validate failed",
+            execution_log="STDERR: boom",
+            contract_name="approved_resource_manifest",
+            contract_payload='{"project_name":"demo"}',
+            latest_artifact_name="main.tf",
+            latest_artifact_content="resource \"x\" \"y\" {}",
+            preserved_invariants=["keep architecture unchanged"],
+            extra_context={"variables_tf": "variable \"x\" {}"},
+        )
+        data = json.loads(payload)
+        assert data["repair_kind"] == "terraform_validation_fix"
+        assert data["contract"]["name"] == "approved_resource_manifest"
+        assert data["contract"]["payload"]["project_name"] == "demo"
+        assert data["latest_failed_artifact"]["name"] == "main.tf"
+        assert data["extra_context"]["variables_tf"].startswith("variable")
+
+    def test_terraform_fix_prompt_includes_repair_context(self):
+        repair_context_json = build_repair_context_json(
+            repair_kind="terraform_validation_fix",
+            attempt=2,
+            max_attempts=2,
+            upstream_agent="Azure-Terraform-Generation-Agent",
+            downstream_component="terraform init + validate",
+            failure_message="terraform validate failed",
+            execution_log="STDERR: invalid block",
+            contract_name="approved_resource_manifest",
+            contract_payload='{"project_name":"demo"}',
+            latest_artifact_name="main.tf",
+            latest_artifact_content="resource \"x\" \"y\" {}",
+        )
+        prompt = build_terraform_fix_prompt(
+            spec_json='{"project_name":"demo"}',
+            approved_resource_manifest_json='{"project_name":"demo"}',
+            previous_main_tf='resource "x" "y" {}',
+            previous_variables_tf='variable "name" {}',
+            previous_outputs_tf='output "id" {}',
+            validation_error="terraform validate failed",
+            repair_context_json=repair_context_json,
+        )
+        assert "terraform validate failed" in prompt
+        assert "machine-to-machine" in prompt.lower() or "標準化修復摘要" in prompt
+        assert '"repair_kind": "terraform_validation_fix"' in prompt
+
+    def test_render_repair_context_block_formats_markdown_section(self):
+        payload = build_repair_context_json(
+            repair_kind="diagram_regen",
+            attempt=1,
+            max_attempts=2,
+            upstream_agent="Azure-Diagram-Generation-Agent",
+            downstream_component="local diagram renderer",
+            failure_message="boom",
+        )
+        block = render_repair_context_block(
+            payload,
+            heading="standardized repair context:",
+        )
+        assert block.startswith("standardized repair context:\n```json\n")
+        assert '"repair_kind": "diagram_regen"' in block
+        assert block.endswith("```\n\n")
+
+    def test_render_prompt_block_formats_fenced_section(self):
+        block = render_prompt_block("main.tf:", 'resource "x" "y" {}', language="hcl")
+        assert block.startswith("main.tf:\n```hcl\n")
+        assert 'resource "x" "y" {}' in block
+        assert block.endswith("```\n\n")
+
+    def test_build_terraform_repair_payload_renders_all_core_sections(self):
+        payload = build_terraform_repair_payload(
+            spec_json='{"project_name":"demo"}',
+            approved_resource_manifest_json='{"project_name":"demo"}',
+            previous_main_tf='resource "x" "y" {}',
+            previous_variables_tf='variable "name" {}',
+            previous_outputs_tf='output "id" {}',
+            validation_error="terraform validate failed",
+            previous_locals_tf='locals { x = 1 }',
+            repair_context_json='{"repair_kind":"terraform_validation_fix"}',
+            spec_heading="spec.json:",
+            manifest_heading="approved_resource_manifest.json:",
+            main_heading="main.tf:",
+            variables_heading="variables.tf:",
+            outputs_heading="outputs.tf:",
+            locals_heading="locals.tf:",
+            versions_heading="versions.tf:",
+            providers_heading="providers.tf:",
+            error_heading="terraform validation error:",
+            repair_context_heading="standardized repair context:",
+        )
+        assert "spec.json:" in payload
+        assert "main.tf:" in payload
+        assert "locals.tf:" in payload
+        assert "terraform validation error:" in payload
+        assert "standardized repair context:" in payload
+
+    def test_build_diagram_repair_payload_renders_all_core_sections(self):
+        payload = build_diagram_repair_payload(
+            spec_json='{"project_name":"demo"}',
+            architecture_details_json='{"network":"private"}',
+            previous_diagram_py='print("x")',
+            render_error="ImportError",
+            render_log="[Render] FAILED",
+            previous_approved_resource_manifest_json='{"resources":[]}',
+            available_classes_summary="diagrams.azure.compute: VM",
+            repair_context_json='{"repair_kind":"diagram_regen"}',
+            spec_heading="spec.json:",
+            architecture_heading="architecture_details.json:",
+            diagram_heading="latest failed diagram.py:",
+            error_heading="render error:",
+            render_log_heading="renderer render_log:",
+            manifest_heading="manifest:",
+            classes_heading="classes:",
+            repair_context_heading="standardized repair context:",
+        )
+        assert "architecture_details.json:" in payload
+        assert "latest failed diagram.py:" in payload
+        assert "renderer render_log:" in payload
+        assert "manifest:" in payload
+        assert "classes:" in payload
 
     def test_rules_mentioned(self):
         """prompt 應提及只使用可用類別的規則。"""
@@ -244,7 +415,8 @@ class TestRenderWithAgentRegen:
     async def test_success_after_one_regen(self, sample_diag_output, tmp_output_dir):
         """首次渲染失敗 → agent regen → 第二次渲染成功。"""
         mock_ctx = _make_mock_ctx()
-        failed_result = _make_failed_render_result(error="ImportError: cannot import name 'Foo'")
+        failed_result = _make_failed_render_result(code='from diagrams import Diagram\nprint("autofixed")', error="ImportError: cannot import name 'Foo'")
+        failed_result.render_log = "[Render] FAILED\n[AutoFix] changed import"
         success_result = _make_success_render_result()
         regen_output = _make_regenerated_diag_output()
 
@@ -281,10 +453,55 @@ class TestRenderWithAgentRegen:
         # Agent 被呼叫一次
         mock_agents_mod.invoke_agent_raw.assert_awaited_once()
         mock_agents_mod.build_diagram_regen_prompt.assert_called_once()
+        regen_kwargs = mock_agents_mod.build_diagram_regen_prompt.call_args.kwargs
+        assert regen_kwargs["previous_diagram_py"] == 'from diagrams import Diagram\nprint("autofixed")'
+        assert regen_kwargs["render_log"] == "[Render] FAILED\n[AutoFix] changed import"
+        manifest_payload = json.loads(regen_kwargs["previous_approved_resource_manifest_json"])
+        assert manifest_payload["project_name"] == "test"
         # render_diagram_locally 共被呼叫兩次（初次 + regen 後）
         assert mock_render.await_count == 2
         # 有向使用者輸出 regen 訊息
         assert any("regen" in str(c) for c in mock_ctx.yield_output.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_empty_regenerated_diagram_is_treated_as_failure(self, sample_diag_output, tmp_output_dir):
+        """若 agent regen 回傳空 diagram.py，應視為 regen 失敗而非繼續渲染空檔。"""
+        mock_ctx = _make_mock_ctx()
+        failed_result = _make_failed_render_result(error="SyntaxError")
+        empty_regen_output = DiagramOutput(
+            diagram_py="",
+            approved_resource_manifest=ResourceManifest(),
+            status=StepStatus.SUCCESS,
+        )
+
+        with (
+            patch(
+                "orchestrator_app.diagram_renderer.render_diagram_locally",
+                new_callable=AsyncMock,
+                return_value=failed_result,
+            ) as mock_render,
+            patch("orchestrator_app.executors.agents") as mock_agents_mod,
+            patch(
+                "orchestrator_app.diagram_renderer.get_available_azure_classes_summary",
+                return_value="diagrams.azure.compute: VM",
+            ),
+            patch("orchestrator_app.executors.MAX_AGENT_REGEN_RETRIES", 1),
+        ):
+            mock_agents_mod.invoke_agent_raw = AsyncMock(return_value=('{}', "thread-1"))
+            mock_agents_mod.parse_diagram_output.return_value = empty_regen_output
+            mock_agents_mod.build_diagram_regen_prompt.return_value = "regen prompt"
+
+            from orchestrator_app.executors import _render_with_agent_regen
+
+            result = await _render_with_agent_regen(
+                sample_diag_output, tmp_output_dir, mock_ctx,
+                spec_json='{"project_name": "test"}',
+                arch_details_json="{}",
+            )
+
+        assert result.diagram_image == b""
+        assert "empty diagram_py" in result.error
+        mock_render.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_all_retries_exhausted(self, sample_diag_output, tmp_output_dir):

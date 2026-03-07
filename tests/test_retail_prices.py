@@ -11,7 +11,7 @@ import pytest
 
 os.environ.setdefault("MOCK_MODE", "true")
 
-from orchestrator_app.contracts import CostLineItem, CostStructureOutput, StepStatus
+from orchestrator_app.contracts import PricingLineItem, PricingStructureOutput, StepStatus
 from orchestrator_app.retail_prices import (
     PricedLineItem,
     RetailPrice,
@@ -26,8 +26,8 @@ from orchestrator_app.xlsx_builder import build_estimate_xlsx
 # ======================================================================
 # Fixtures
 # ======================================================================
-def _make_item(**overrides) -> CostLineItem:
-    """Helper to create a CostLineItem with defaults."""
+def _make_item(**overrides) -> PricingLineItem:
+    """Helper to create a PricingLineItem with defaults."""
     defaults = dict(
         resource_type="azurerm_firewall",
         name="hub-fw",
@@ -43,7 +43,7 @@ def _make_item(**overrides) -> CostLineItem:
         notes="",
     )
     defaults.update(overrides)
-    return CostLineItem(**defaults)
+    return PricingLineItem(**defaults)
 
 
 # ======================================================================

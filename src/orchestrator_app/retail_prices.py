@@ -22,7 +22,7 @@ from typing import Any, Optional
 
 import aiohttp
 
-from .contracts import CostLineItem
+from .contracts import PricingLineItem
 
 logger = logging.getLogger("orchestrator.retail_prices")
 
@@ -67,7 +67,7 @@ class RetailPrice:
 # ---------------------------------------------------------------------------
 # product_id → serviceName 映射表
 # ---------------------------------------------------------------------------
-# product_id 是 Step 3a (CostStructureOutput) 中 LLM 給出的 slug，
+# product_id 是 Step 7B (PricingStructureOutput) 中 LLM 給出的 slug，
 # serviceName 是 Azure Retail Prices API 用的官方服務名（case-sensitive）。
 PRODUCT_SLUG_TO_SERVICE: dict[str, str] = {
     "resource-groups": "",  # Free, no pricing
@@ -190,11 +190,11 @@ ARM_TYPE_TO_SERVICE: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Resolve service name for a CostLineItem
+# Resolve service name for a PricingLineItem
 # ---------------------------------------------------------------------------
-def resolve_service_name(item: CostLineItem) -> str:
+def resolve_service_name(item: PricingLineItem) -> str:
     """
-    Determine the Azure Retail Prices API 'serviceName' for a given CostLineItem.
+    Determine the Azure Retail Prices API 'serviceName' for a given PricingLineItem.
     Uses product_id slug, then terraform resource_type, then ARM type as fallbacks.
     """
     # 1. Try product_id slug
@@ -295,7 +295,7 @@ async def _query_api(
 # ---------------------------------------------------------------------------
 # Score & pick the best price match for a line item
 # ---------------------------------------------------------------------------
-def _score_match(item: CostLineItem, price: dict[str, Any]) -> float:
+def _score_match(item: PricingLineItem, price: dict[str, Any]) -> float:
     """
     Score how well a price record matches the line item (higher = better).
     Returns negative for obvious mismatches.
@@ -336,8 +336,8 @@ def _score_match(item: CostLineItem, price: dict[str, Any]) -> float:
     return score
 
 
-def pick_best_price(item: CostLineItem, api_items: list[dict[str, Any]]) -> RetailPrice | None:
-    """Pick the single best matching price record for a CostLineItem."""
+def pick_best_price(item: PricingLineItem, api_items: list[dict[str, Any]]) -> RetailPrice | None:
+    """Pick the single best matching price record for a PricingLineItem."""
     if not api_items:
         return None
 
@@ -357,13 +357,13 @@ def pick_best_price(item: CostLineItem, api_items: list[dict[str, Any]]) -> Reta
 
 
 # ---------------------------------------------------------------------------
-# PricedLineItem: combines original CostLineItem + API price
+# PricedLineItem: combines original PricingLineItem + API price
 # ---------------------------------------------------------------------------
 @dataclass
 class PricedLineItem:
-    """A CostLineItem enriched with the official retail price."""
+    """A PricingLineItem enriched with the official retail price."""
 
-    line_item: CostLineItem
+    line_item: PricingLineItem
     retail_price: RetailPrice | None
     unit_price_usd: float  # Official unit price (0 if not found)
     monthly_cost_usd: float  # quantity × unit_price (or fallback to LLM estimate)
@@ -378,17 +378,17 @@ class PricedLineItem:
 # Main entry point: fetch prices for all line items
 # ---------------------------------------------------------------------------
 async def fetch_prices_for_line_items(
-    line_items: list[CostLineItem],
+    line_items: list[PricingLineItem],
 ) -> list[PricedLineItem]:
     """
-    For each CostLineItem, query Azure Retail Prices API and return
+    For each PricingLineItem, query Azure Retail Prices API and return
     a PricedLineItem with official pricing (or fallback to LLM estimate).
     """
     results: list[PricedLineItem] = []
 
     async with aiohttp.ClientSession() as session:
         # Group items by service_name to reduce API calls
-        service_groups: dict[str, list[tuple[int, CostLineItem]]] = {}
+        service_groups: dict[str, list[tuple[int, PricingLineItem]]] = {}
         for idx, item in enumerate(line_items):
             svc = resolve_service_name(item)
             service_groups.setdefault(svc, []).append((idx, item))
@@ -457,7 +457,7 @@ async def fetch_prices_for_line_items(
                         source="retail_api",
                     ))
                 else:
-                    # Fallback to LLM estimate from Step 3a
+                    # Fallback to LLM estimate from Step 7B
                     results.append(PricedLineItem(
                         line_item=item,
                         retail_price=best,

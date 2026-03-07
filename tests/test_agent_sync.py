@@ -11,9 +11,8 @@ test_agent_sync.py — 測試 agent_sync YAML 載入 + foundry_agents YAML loadi
 
 from __future__ import annotations
 
+import json
 import os
-import tempfile
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -34,10 +33,10 @@ class TestLoadYaml:
         """Should load any of our 5 YAML files without error."""
         from orchestrator_app.agent_sync import load_yaml
 
-        doc = load_yaml("Architecture-Clarification-Agent")
+        doc = load_yaml("Azure-Architecture-Clarification-Agent")
         assert doc is not None
         assert doc["kind"] == "Prompt"
-        assert doc["name"] == "Architecture-Clarification-Agent"
+        assert doc["name"] == "Azure-Architecture-Clarification-Agent"
         assert "instructions" in doc
 
     def test_load_nonexistent_raises(self):
@@ -67,51 +66,51 @@ class TestLoadAgentDefFromYaml:
     """Test the YAML → _AgentDef conversion in foundry_agents."""
 
     def test_load_clarification_agent(self):
-        """Architecture-Clarification-Agent: model=gpt-5.2, tools=[]."""
+        """Azure-Architecture-Clarification-Agent: model=gpt-5.4, tools=[]."""
         from orchestrator_app.foundry_agents import _load_agent_def_from_yaml
 
-        result = _load_agent_def_from_yaml("Architecture-Clarification-Agent")
+        result = _load_agent_def_from_yaml("Azure-Architecture-Clarification-Agent")
         assert result is not None
-        assert result.model == "gpt-5.2"
+        assert result.model == "gpt-5.4"
         assert result.tools == []
         assert len(result.instructions) > 100
 
     def test_load_terraform_agent_no_tools(self):
-        """Azure-Terraform-Architect-Agent: model=gpt-5.3-codex, tools=[] (Foundry 實際定義)."""
+        """Azure-Terraform-Generation-Agent: model=gpt-5.4, tools=[] (本地 Copilot 定義)."""
         from orchestrator_app.foundry_agents import _load_agent_def_from_yaml
 
-        result = _load_agent_def_from_yaml("Azure-Terraform-Architect-Agent")
+        result = _load_agent_def_from_yaml("Azure-Terraform-Generation-Agent")
         assert result is not None
-        assert result.model == "gpt-5.3-codex"
-        assert result.tools == []  # Foundry 上無 tools
+        assert result.model == "gpt-5.4"
+        assert result.tools == []
         assert len(result.instructions) > 200
 
     def test_load_diagram_agent_no_tools(self):
-        """DaC-Dagrams-Mingrammer: model=gpt-5.3-codex, tools=[] (Foundry 實際定義)."""
+        """Azure-Diagram-Generation-Agent: model=gpt-5.4, tools=[] (本地 Copilot 定義)."""
         from orchestrator_app.foundry_agents import _load_agent_def_from_yaml
 
-        result = _load_agent_def_from_yaml("DaC-Dagrams-Mingrammer")
+        result = _load_agent_def_from_yaml("Azure-Diagram-Generation-Agent")
         assert result is not None
-        assert result.model == "gpt-5.3-codex"
+        assert result.model == "gpt-5.4"
         assert result.tools == []
 
     def test_load_cost_browser_agent_local_only(self):
-        """Agent-AzureCalculator-BrowserAuto: local-only YAML (尚未部署到 Foundry)."""
+        """Azure-Pricing-Browser-Agent: local-only YAML (尚未部署到 Foundry)."""
         from orchestrator_app.foundry_agents import _load_agent_def_from_yaml
 
-        result = _load_agent_def_from_yaml("Agent-AzureCalculator-BrowserAuto")
+        result = _load_agent_def_from_yaml("Azure-Pricing-Browser-Agent")
         assert result is not None
         tool_types = [t["type"] for t in result.tools]
         assert "browser_automation_preview" in tool_types
         assert "web_search_preview" in tool_types
 
     def test_load_cost_structure_agent_no_tools(self):
-        """Agent-AzureCalculator: model=gpt-5.2, tools=[] (Foundry 實際定義)."""
+        """Azure-Pricing-Structure-Agent: model=gpt-5.4, tools=[] (Foundry 實際定義)."""
         from orchestrator_app.foundry_agents import _load_agent_def_from_yaml
 
-        result = _load_agent_def_from_yaml("Agent-AzureCalculator")
+        result = _load_agent_def_from_yaml("Azure-Pricing-Structure-Agent")
         assert result is not None
-        assert result.model == "gpt-5.2"
+        assert result.model == "gpt-5.4"
         assert result.tools == []  # Foundry 上無 tools
 
     def test_nonexistent_returns_none(self):
@@ -176,8 +175,135 @@ class TestYamlRoundTrip:
                 assert "type" in tool, f"{name}: tool missing 'type' key: {tool}"
 
 
+class TestDiagramOutputParsing:
+    def test_parse_diagram_output_preserves_escaped_newline_in_string_literal(self):
+        from orchestrator_app.foundry_agents import parse_diagram_output
+
+        diagram_py = (
+            'ddos = DDOSProtectionPlans("DDoS Protection\\nStandard")\n'
+            'frontdoor = FrontDoors("Azure Front Door")'
+        )
+        raw = json.dumps({
+            "diagram_py": diagram_py,
+            "render_log": "ok",
+            "approved_resource_manifest": {"resources": []},
+        }, ensure_ascii=False)
+
+        result = parse_diagram_output(raw)
+
+        assert 'DDOSProtectionPlans("DDoS Protection\\nStandard")' in result.diagram_py
+        assert 'FrontDoors("Azure Front Door")' in result.diagram_py
+
+    def test_parse_diagram_output_unescapes_single_line_script_boundaries(self):
+        from orchestrator_app.foundry_agents import parse_diagram_output
+
+        raw = json.dumps({
+            "diagram_py": 'print("hello")\\nprint("world")',
+            "render_log": "ok",
+            "approved_resource_manifest": {"resources": []},
+        }, ensure_ascii=False)
+
+        result = parse_diagram_output(raw)
+
+        assert result.diagram_py == 'print("hello")\nprint("world")'
+
+
 # ======================================================================
-# 5. Observability graceful degradation
+# 5. SDK compatibility helpers
+# ======================================================================
+class _AsyncVersionList:
+    def __init__(self, items):
+        self._items = items
+
+    def __aiter__(self):
+        self._iter = iter(self._items)
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._iter)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+
+
+class TestSdkCompatibility:
+    @pytest.mark.asyncio
+    async def test_agent_sync_latest_definition_falls_back_to_get_version(self):
+        from orchestrator_app.agent_sync import _get_latest_agent_definition
+
+        class FakeAgents:
+            async def get_version(self, agent_name, agent_version):
+                assert agent_name == "DemoAgent"
+                assert agent_version == "7"
+                return {"definition": {"model": "gpt-5.4", "instructions": "hello", "tools": []}}
+
+            def list_versions(self, agent_name, limit=1, order="desc"):
+                return _AsyncVersionList([])
+
+        class FakeClient:
+            agents = FakeAgents()
+
+        agent = {"name": "DemoAgent", "latest_version": "7"}
+        definition = await _get_latest_agent_definition(FakeClient(), "DemoAgent", agent)
+
+        assert definition["model"] == "gpt-5.4"
+        assert definition["instructions"] == "hello"
+
+    @pytest.mark.asyncio
+    async def test_push_yaml_to_foundry_uses_create_version(self, monkeypatch):
+        from orchestrator_app import agent_sync
+
+        calls: list[tuple[str, object]] = []
+
+        monkeypatch.setattr(
+            agent_sync,
+            "load_yaml",
+            lambda agent_name: {
+                "kind": "Prompt",
+                "model": {"id": "gpt-5.4"},
+                "instructions": "demo instructions",
+                "tools": [],
+            },
+        )
+
+        class FakeCredential:
+            async def close(self):
+                calls.append(("credential.close", None))
+
+        class FakeAgents:
+            async def get(self, agent_name):
+                calls.append(("agents.get", agent_name))
+                return {"name": agent_name}
+
+            async def create_version(self, agent_name, *, definition):
+                calls.append(("agents.create_version", {"agent_name": agent_name, "definition": definition}))
+                return {"version": "3"}
+
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.agents = FakeAgents()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        monkeypatch.setattr(agent_sync, "DefaultAzureCredential", FakeCredential)
+        monkeypatch.setattr(agent_sync, "AIProjectClient", FakeClient)
+
+        await agent_sync.push_yaml_to_foundry("DemoAgent", publish=True)
+
+        assert calls[0] == ("agents.get", "DemoAgent")
+        create_call = next(item for item in calls if item[0] == "agents.create_version")
+        assert create_call[1]["agent_name"] == "DemoAgent"
+        assert create_call[1]["definition"]["model"] == "gpt-5.4"
+        assert create_call[1]["definition"]["instructions"] == "demo instructions"
+        assert all(name not in {"agents.create", "agents.update", "agents.publish"} for name, _ in calls)
+
+
+# ======================================================================
+# 6. Observability graceful degradation
 # ======================================================================
 class TestObservability:
     """Test observability setup handles missing connection string gracefully."""

@@ -29,10 +29,10 @@ from orchestrator_app.contracts import (
     AgentQuestion,
     Assumption,
     ClarifyingQuestion,
-    CostLineItem,
-    CostOutput,
-    CostStructureOutput,
     DiagramOutput,
+    PricingLineItem,
+    PricingOutput,
+    PricingStructureOutput,
     Spec,
     StepResult,
     StepStatus,
@@ -42,15 +42,16 @@ from orchestrator_app.contracts import (
 from orchestrator_app.io import (
     ensure_output_dir,
     get_artifact_list,
-    write_cost_output,
-    write_cost_structure_output,
+    zip_output,
+    write_pricing_output,
+    write_pricing_structure_output,
     write_diagram_output,
     write_executive_summary,
     write_spec,
     write_terraform_output,
 )
-from orchestrator_app.executors import _normalize_input
-from orchestrator_app.main import build_agent, build_workflow
+from orchestrator_app.executors import _coerce_pricing_followup_answer, _normalize_input
+from orchestrator_app.main import _build_initial_payload, build_agent, build_workflow
 from orchestrator_app import mock_agents
 from orchestrator_app.diagram_renderer import render_diagram_locally
 
@@ -121,6 +122,39 @@ class TestNormalizeInput:
         spec, questions = _normalize_input("random text")
         assert len(questions) <= 5
 
+    def test_preferred_language_from_json(self):
+        spec, _ = _normalize_input(json.dumps({"preferred_language": "en-US", "project_name": "demo"}))
+        assert spec.preferred_language == "en-US"
+
+    def test_preferred_language_defaults_to_zh_tw(self):
+        spec, _ = _normalize_input("plain text")
+        assert spec.preferred_language == "zh-TW"
+
+
+class TestPricingFollowupNormalization:
+    def test_blank_pricing_followup_uses_defaults_in_zh_tw(self):
+        answer = _coerce_pricing_followup_answer("   ", "zh-TW")
+        assert "使用預設值" in answer
+        assert "最終 JSON" in answer
+
+    def test_nonblank_pricing_followup_is_preserved(self):
+        answer = _coerce_pricing_followup_answer("SQL 用 16 vCore，其餘預設", "zh-TW")
+        assert answer == "SQL 用 16 vCore，其餘預設"
+
+
+class TestInitialPayload:
+    def test_build_initial_payload_injects_language_into_json(self):
+        payload = _build_initial_payload('{"project_name":"demo"}', "en-US")
+        data = json.loads(payload)
+        assert data["project_name"] == "demo"
+        assert data["preferred_language"] == "en-US"
+
+    def test_build_initial_payload_wraps_plain_text(self):
+        payload = _build_initial_payload("need app service", "zh-TW")
+        data = json.loads(payload)
+        assert data["preferred_language"] == "zh-TW"
+        assert data["raw_input"] == "need app service"
+
 
 # ======================================================================
 # Test: Mock agents
@@ -147,36 +181,45 @@ class TestMockAgents:
         assert len(result.approved_resource_manifest.resources) > 0
 
     @pytest.mark.asyncio
-    async def test_cost_structure_agent(self):
+    async def test_pricing_structure_agent(self):
         spec = Spec(project_name="test", region="eastasia")
         manifest_json = json.dumps({"resources": []})
-        result = await mock_agents.invoke_cost_structure_agent(spec.to_json(), manifest_json)
-        assert isinstance(result, CostStructureOutput)
+        result = await mock_agents.invoke_pricing_structure_agent(spec.to_json(), manifest_json)
+        assert isinstance(result, PricingStructureOutput)
         assert result.status == StepStatus.SUCCESS
         assert len(result.line_items) > 0
         for item in result.line_items:
-            assert isinstance(item, CostLineItem)
+            assert isinstance(item, PricingLineItem)
             assert item.resource_type
             assert item.estimated_monthly_usd >= 0
 
     @pytest.mark.asyncio
-    async def test_cost_browser_agent(self):
-        # First get cost structure output, then pass to browser agent
+    async def test_pricing_browser_agent(self):
+        # First get pricing structure output, then pass to browser agent
         spec = Spec(project_name="test", region="eastasia")
         manifest_json = json.dumps({"resources": []})
-        structure = await mock_agents.invoke_cost_structure_agent(spec.to_json(), manifest_json)
-        result = await mock_agents.invoke_cost_browser_agent(structure.to_json())
-        assert isinstance(result, CostOutput)
+        structure = await mock_agents.invoke_pricing_structure_agent(spec.to_json(), manifest_json)
+        result = await mock_agents.invoke_pricing_browser_agent(structure.to_json())
+        assert isinstance(result, PricingOutput)
         assert result.status == StepStatus.SUCCESS
         assert result.calculator_share_url is not None
         assert result.monthly_estimate_usd is not None
         assert result.cost_breakdown is not None
+
+    def test_mock_prompt_builders_track_language(self):
+        spec_json = json.dumps({"preferred_language": "en-US", "project_name": "demo"})
+        prompt = mock_agents.build_architecture_clarification_prompt(spec_json)
+        assert "[MOCK:en-US]" in prompt
 
 
 # ======================================================================
 # Test: I/O writers
 # ======================================================================
 class TestIOWriters:
+    def test_ensure_output_dir_uses_latest_env(self, tmp_output_dir, monkeypatch):
+        monkeypatch.setenv("OUTPUT_DIR", str(tmp_output_dir))
+        assert ensure_output_dir() == tmp_output_dir
+
     def test_write_spec(self, tmp_output_dir, sample_input_json):
         spec, _ = _normalize_input(sample_input_json)
         path = write_spec(spec, tmp_output_dir)
@@ -202,19 +245,19 @@ class TestIOWriters:
         assert (tmp_output_dir / "diagram.py").exists()
 
     @pytest.mark.asyncio
-    async def test_write_cost_structure_output(self, tmp_output_dir):
-        structure = await mock_agents.invoke_cost_structure_agent("{}", "{}")
-        paths = write_cost_structure_output(structure, tmp_output_dir)
+    async def test_write_pricing_structure_output(self, tmp_output_dir):
+        structure = await mock_agents.invoke_pricing_structure_agent("{}", "{}")
+        paths = write_pricing_structure_output(structure, tmp_output_dir)
         assert len(paths) > 0
-        assert (tmp_output_dir / "cost_structure.json").exists()
-        data = json.loads((tmp_output_dir / "cost_structure.json").read_text())
+        assert (tmp_output_dir / "pricing_structure.json").exists()
+        data = json.loads((tmp_output_dir / "pricing_structure.json").read_text())
         assert "line_items" in data
 
     @pytest.mark.asyncio
-    async def test_write_cost_output(self, tmp_output_dir):
-        structure = await mock_agents.invoke_cost_structure_agent("{}", "{}")
-        cost = await mock_agents.invoke_cost_browser_agent(structure.to_json())
-        paths = write_cost_output(cost, tmp_output_dir)
+    async def test_write_pricing_output(self, tmp_output_dir):
+        structure = await mock_agents.invoke_pricing_structure_agent("{}", "{}")
+        cost = await mock_agents.invoke_pricing_browser_agent(structure.to_json())
+        paths = write_pricing_output(cost, tmp_output_dir)
         assert len(paths) > 0
 
     def test_write_executive_summary(self, tmp_output_dir, sample_input_json):
@@ -228,12 +271,44 @@ class TestIOWriters:
         content = path.read_text()
         assert "test-project" in content
 
+    def test_write_executive_summary_in_english(self, tmp_output_dir):
+        spec, _ = _normalize_input(
+            json.dumps(
+                {
+                    "project_name": "english-project",
+                    "region": "eastasia",
+                    "environment_count": 1,
+                    "currency": "USD",
+                    "commitment": "PAYG",
+                    "network_model": "public",
+                    "tags": {"team": "ccoe"},
+                    "preferred_language": "en-US",
+                }
+            )
+        )
+        path = write_executive_summary(spec, [], tmp_output_dir)
+        content = path.read_text()
+        assert "Executive Summary" in content
+        assert "Next Steps" in content
+
     def test_get_artifact_list(self, tmp_output_dir):
         # 建立一些假檔案
         (tmp_output_dir / "a.tf").write_text("test")
         (tmp_output_dir / "b.json").write_text("{}")
         artifacts = get_artifact_list(tmp_output_dir)
         assert len(artifacts) >= 2
+
+    def test_zip_output_stays_under_output_dir(self, tmp_output_dir):
+        (tmp_output_dir / "a.tf").write_text("test")
+        (tmp_output_dir / "nested").mkdir()
+        (tmp_output_dir / "nested" / "b.json").write_text("{}")
+
+        zip_path = zip_output(tmp_output_dir)
+
+        assert zip_path == tmp_output_dir / "artifacts.zip"
+        assert zip_path.exists()
+        artifacts = get_artifact_list(tmp_output_dir)
+        assert "artifacts.zip" in artifacts
 
 
 # ======================================================================
@@ -377,7 +452,7 @@ class TestFullWorkflow:
             pairs = self._parse_requests(response)
             answers = []
             for rid, question in pairs:
-                if question.agent_name == "Requirement-Clarifier-Agent":
+                if question.agent_name == "Requirements-Clarification-Stage":
                     answers.append((rid, AgentAnswer(command="done")))
                 else:
                     answers.append((rid, AgentAnswer(command="approve")))
@@ -406,7 +481,7 @@ class TestFullWorkflow:
             pairs = self._parse_requests(response)
             answers = []
             for rid, question in pairs:
-                if question.agent_name == "Requirement-Clarifier-Agent":
+                if question.agent_name == "Requirements-Clarification-Stage":
                     answers.append((rid, AgentAnswer(
                         answer_text="project_name=nlp-test\ntags=team:test,env:dev",
                     )))
@@ -451,11 +526,11 @@ class TestFullWorkflow:
             answers = []
 
             for rid, question in pairs:
-                if question.agent_name == "Requirement-Clarifier-Agent":
+                if question.agent_name == "Requirements-Clarification-Stage":
                     answers.append((rid, AgentAnswer(command="done")))
                     continue
 
-                if question.agent_name == "DaC-Dagrams-Mingrammer":
+                if question.agent_name == "Azure-Diagram-Generation-Agent":
                     diagram_review_turns += 1
                     if revise_count < 2:
                         revise_count += 1
@@ -477,14 +552,6 @@ class TestFullWorkflow:
         assert revise_count >= 2
         assert diagram_review_turns >= 3
 
-        terraform_main_candidates = [
-            tmp_output_dir / "terraform" / "main.tf",
-            Path("out") / "terraform" / "main.tf",
-        ]
-        estimate_xlsx_candidates = [
-            tmp_output_dir / "estimate.xlsx",
-            Path("out") / "estimate.xlsx",
-        ]
-
-        assert any(path.exists() for path in terraform_main_candidates)
-        assert any(path.exists() for path in estimate_xlsx_candidates)
+        assert (tmp_output_dir / "terraform" / "main.tf").exists()
+        assert (tmp_output_dir / "estimate.xlsx").exists()
+        assert (tmp_output_dir / "artifacts.zip").exists()

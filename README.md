@@ -1,492 +1,389 @@
-# CCoE Orchestrator Agent
+# Azure Platform Orchestrator
+
+[English version](README.en.md)
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/)
 [![MAF](https://img.shields.io/badge/Microsoft%20Agent%20Framework-1.0.0rc2-purple)](https://pypi.org/project/agent-framework-core/)
 
-> **使用 Microsoft Agent Framework (MAF) `WorkflowBuilder` 串接 9 個 Executor 的 Azure 架構編排器。**
-> Orchestrator 只做需求澄清與 spec normalization — 所有重工作委派給 Microsoft Foundry 內的 specialist agents。
+以 Microsoft Agent Framework 建立的 Azure 架構編排器。此專案將需求正規化、多輪澄清、架構圖生成與渲染、Terraform 產生、價格估算與摘要整理串成單一 workflow。
 
----
+目前採用混合執行模型：
 
-## 目錄
+- `Azure-Diagram-Generation-Agent` 與 `Azure-Terraform-Generation-Agent` 走本地 GitHub Copilot provider。
+- 架構澄清與 Pricing 相關 agent 仍可走 Microsoft Foundry。
+- `MOCK_MODE=true` 時，整條流程可離線測試。
 
-- [架構概覽](#架構概覽)
-- [Workflow 流程圖](#workflow-流程圖)
-- [Agents 與本地模組](#agents-與本地模組)
-- [快速開始](#快速開始)
-- [環境變數](#環境變數)
-- [Agent 定義同步 (agent_sync)](#agent-定義同步-agent_sync)
-- [專案結構](#專案結構)
-- [交付物清單](#交付物清單)
-- [Workflow 行為規則](#workflow-行為規則)
-- [可觀測性 (Observability)](#可觀測性-observability)
-- [測試](#測試)
-- [Docker 部署](#docker-部署)
+## 功能摘要
 
----
+- 以 `WorkflowBuilder` 串接 9 個主要步驟
+- 支援 CLI 與 HTTP server 兩種執行模式
+- 支援繁體中文 / English session 語言切換
+- 本地渲染 `diagram.py` 為 PNG/SVG，並支援 import auto-fix / regenerate
+- Terraform 與 pricing structure 於架構圖核准後並行執行
+- 將所有產物集中寫入 `out/`（或自訂 `OUTPUT_DIR`）
+- 提供 `agent_sync.py` 同步 prompt YAML 與 Foundry agent 定義
 
-## 架構概覽
+## Workflow 概覽
 
-```
-使用者需求 (自然語言)
-      │
-      ▼
-┌──────────────────────────────────────────────────────────────┐
-│                   Orchestrator Agent (MAF)                    │
-│                                                              │
-│  [1] NormalizeExecutor                使用者輸入 → spec.json │
-│  [2] RequirementClarificationExecutor 多輪對話補齊基本欄位   │
-│  [3] ArchitectureClarificationExecutor                       │
-│       ↳ Architecture-Clarification-Agent (Foundry)           │
-│         → architecture_details.json                          │
-│                                                              │
-│  [4] DiagramExecutor                                         │
-│       ↳ DaC-Dagrams-Mingrammer (Foundry) → diagram.py       │
-│  [5] DiagramRenderExecutor    本地渲染 diagram.py → PNG      │
-│  [6] DiagramApprovalExecutor  ◆ GATE — 使用者核准架構圖      │
-│                                                              │
-│  [7] ParallelTerraformCostExecutor ─── 並 行 ───             │
-│       ├─ Azure-Terraform-Architect-Agent → main.tf, ...      │
-│       └─ Agent-AzureCalculator → cost_structure.json         │
-│                                                              │
-│  [8] RetailPricesCostExecutor  Azure Retail Prices API       │
-│       (或 CostBrowserExecutor, 依 COST_STEP3B_MODE)          │
-│       → estimate.xlsx                                        │
-│                                                              │
-│  [9] SummaryExecutor           → executive_summary.md        │
-└──────────────────────────────────────────────────────────────┘
-      │
-      ▼
-  交付物清單 (out/)
-```
-
-> **設計決策**：Architecture-Clarification-Agent 在「畫圖前」確認所有架構細節；
-> 架構圖核准後才「同時」呼叫 Terraform + Cost Agent，縮短總等待時間並避免 IaC 重做。
-
----
-
-## Workflow 流程圖
-
-```
-      使用者輸入
-          │
-    ┌─────▼─────┐
-    │ Normalize  │  → spec.json
-    └─────┬─────┘
-    ┌─────▼──────────────────┐
-    │ RequirementClarification│  ⟲ multi-turn（補齊欄位）
-    └─────┬──────────────────┘
-    ┌─────▼──────────────────────┐
-    │ ArchitectureClarification   │  ⟲ multi-turn (10 維度)
-    │ (Foundry Agent)             │  → architecture_details.json
-    └─────┬──────────────────────┘
-    ┌─────▼──────────┐
-    │ DiagramExecutor │  ⟲ multi-turn
-    │ (Foundry Agent) │  → diagram.py
-    └─────┬──────────┘
-    ┌─────▼───────────────┐
-    │ DiagramRenderExecutor│  本地渲染 → diagram.png
-    │ (auto-fix imports)   │  → render_log.txt
-    └─────┬───────────────┘
-    ┌─────▼──────────────────┐
-    │ DiagramApprovalExecutor │  ◆ GATE: approve / revise / reject
-    └─────┬──────────────────┘
-          │ (核准後)
-    ┌─────▼───────────────────────────────┐
-    │ ParallelTerraformCostExecutor       │
-    │  ┌────────────────┬────────────────┐│
-    │  │ TF Agent       │ Cost Agent     ││
-    │  │→ main.tf ...   │→ cost_struct   ││
-    │  └────────────────┴────────────────┘│
-    └─────┬───────────────────────────────┘
-    ┌─────▼──────────────────────┐
-    │ RetailPricesCostExecutor   │  Azure Retail Prices API
-    │ (或 CostBrowserExecutor)   │  → estimate.xlsx
-    └─────┬──────────────────────┘
-    ┌─────▼──────────┐
-    │ SummaryExecutor │  → executive_summary.md
-    └─────┬──────────┘
-          ▼
-     WorkflowResult
-```
-
----
-
-## Agents 與本地模組
-
-### Foundry Specialist Agents（遠端呼叫）
-
-| Agent Name | 職責 | 輸入 | 輸出 |
+| Step | 元件 | 說明 | 主要輸出 |
 |---|---|---|---|
-| **Architecture-Clarification-Agent** | 多輪對話確認架構細節（10 個維度） | `spec.json` | `architecture_details.json` |
-| **DaC-Dagrams-Mingrammer** | 生成 Python diagrams 程式碼 | `spec.json` + `architecture_details.json` | `diagram.py` |
-| **Azure-Terraform-Architect-Agent** | 生成 Terraform HCL (AVM) | `spec.json` + `approved_resource_manifest` | `main.tf`, `variables.tf`, `outputs.tf`, `locals.tf`, `versions.tf`, `providers.tf` |
-| **Agent-AzureCalculator** | 估算 Azure 成本結構 | `spec.json` + `approved_resource_manifest` | `cost_structure.json` |
-| **Agent-AzureCalculator-BrowserAuto** | 瀏覽器自動化查詢 Azure 計算機 | `cost_structure.json` | `estimate.xlsx`（browser mode 用） |
+| 1 | `NormalizeExecutor` | 將使用者輸入正規化成 `Spec` | `spec.json` |
+| 2 | `RequirementsClarificationExecutor` | 補齊基本規格欄位 | 更新後的 `spec.json` |
+| 3 | `ArchitectureClarificationExecutor` | 多輪澄清 Azure 架構細節 | `architecture_details` |
+| 4 | `DiagramGenerationExecutor` | 生成 diagrams Python 程式碼 | `diagram.py` |
+| 5 | `DiagramRenderingExecutor` | 本地渲染架構圖 | `diagram.png` / `diagram.svg`, `render_log.txt` |
+| 6 | `DiagramReviewExecutor` | 等待使用者核准、修訂或退回 | 已核准的 diagram 狀態 |
+| 7 | `ParallelTerraformPricingExecutor` | 並行產生 Terraform 與 pricing structure | Terraform 檔案、`pricing_structure.json` |
+| 8 | `RetailPricingExecutor` / `BrowserPricingExecutor` | 產生成本估算工作簿 | `estimate.xlsx` |
+| 9 | `SummaryExecutor` | 輸出管理摘要與 artifact 清單 | `executive_summary.md`, `artifacts.zip` |
 
-### 本地模組（不需 Foundry）
+## 執行架構
 
-| 模組 | 說明 |
-|---|---|
-| `diagram_renderer.py` | 本地執行 `diagram.py` → PNG，含 auto-fix import 名稱錯誤（MAF Agent 封裝） |
-| `retail_prices.py` | 查詢 Azure Retail Prices REST API，產生逐項定價（免費、無需驗證） |
-| `xlsx_builder.py` | 將定價資料組合成 `estimate.xlsx` |
-| `agent_sync.py` | 同步 Foundry Agent 定義 ↔ 本地 YAML（pull / push） |
-
----
+```text
+User input
+   ↓
+Normalize
+   ↓
+Requirements clarification
+   ↓
+Architecture clarification (Foundry or mock)
+   ↓
+Diagram generation (local Copilot agent or mock)
+   ↓
+Diagram rendering
+   ↓
+Diagram approval gate
+   ↓
+Terraform generation + pricing structure (parallel)
+   ↓
+Retail API or browser pricing
+   ↓
+Executive summary + zipped artifacts
+```
 
 ## 快速開始
 
 ### 先決條件
 
 - Python 3.12+
-- [Graphviz](https://graphviz.org/)（diagram 渲染需要）
-- Azure CLI（Real Mode 需要 `az login`）
+- Graphviz（渲染 diagrams 必要）
+- 可用的 Python 虛擬環境
+- 若使用 Real Mode：
+  - 可存取 Microsoft Foundry project
+  - 可使用 GitHub Copilot provider
+  - 已完成 Azure 身分驗證（例如 `az login`）
 
-### 1. 建立虛擬環境
+### 1. 安裝依賴
 
 ```bash
-cd ccoe-Orchestrator
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 ```
 
-### 2. 設定環境變數
+> 專案目前採 `src/` 目錄結構；若不是透過 VS Code 啟動設定執行，請先設定 `PYTHONPATH`。
+
+### 2. 準備環境變數
 
 ```bash
 cp .env.example .env
-# 編輯 .env 並填入所需的值（參考下方「環境變數」表格）
 ```
 
-### 3. Mock Mode（離線測試）
+最小可用設定：
 
-無需 Azure 登入，使用內建 mock agents 模擬所有 Foundry 回應：
+```dotenv
+MOCK_MODE=true
+RUN_MODE=cli
+OUTPUT_DIR=./out
+PRICING_EXECUTION_MODE=retail_api
+```
+
+### 3. Mock Mode
 
 ```bash
-# .env
-MOCK_MODE=true
-
-# CLI 互動模式（預設）
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 python -m orchestrator_app.main
-
-# CLI 帶入需求
 python -m orchestrator_app.main "我需要 App Service + VNet in eastasia"
-
-# HTTP Server 模式
 RUN_MODE=server python -m orchestrator_app.main
 ```
 
-### 4. Real Mode（連接 Foundry）
+Mock Mode 不需要 Foundry 或 GitHub Copilot 連線，適合開發與測試。
+
+### 4. Real Mode
 
 ```bash
-# .env
-MOCK_MODE=false
-AZURE_AI_PROJECT_ENDPOINT=https://your-foundry-endpoint.services.ai.azure.com/api/...
-
-# 確保已登入 Azure
-az login
-
-# 啟動
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+export MOCK_MODE=false
+export AZURE_AI_PROJECT_ENDPOINT="https://<your-project>.services.ai.azure.com/api/projects/<project-name>"
+export GITHUB_COPILOT_MODEL="gpt-5.4"
+export GITHUB_COPILOT_WORKDIR="out"
 python -m orchestrator_app.main
 ```
 
-### 5. 運行模式
+Real Mode 說明：
 
-| 模式 | 說明 | 啟動方式 |
-|---|---|---|
-| **CLI** (預設) | 互動式命令列，agent 追問時從 stdin 讀取回答；支援 `/done`、`/skip` 指令 | `RUN_MODE=cli python -m orchestrator_app.main` |
-| **HTTP Server** | ASGI hosting adapter，Multi-turn 由 adapter 自動處理 | `RUN_MODE=server python -m orchestrator_app.main` |
+- 架構澄清 / pricing agent 會使用 Foundry project endpoint。
+- diagram / terraform agent 會使用本地 GitHub Copilot provider。
+- 若需呼叫 Foundry，請確認目前 shell 已具備有效 Azure 認證。
 
-Server 啟動後，預設在 `http://localhost:8088` 接收請求（含 `/health` 健康檢查端點）。
+## 執行模式
 
----
+| 模式 | 說明 |
+|---|---|
+| `RUN_MODE=cli` | 預設模式。啟動後會先詢問語言，並在多輪對話期間從 stdin 讀取回答。 |
+| `RUN_MODE=server` | 啟動 HTTP server，供 hosting adapter / 外部呼叫使用。預設埠為 `8088`。 |
 
-## 環境變數
+CLI 模式支援 `/done`、`/skip` 等多輪指令。
 
-### 核心設定
+HTTP 模式首個 request 可帶入：
 
-| 變數 | 預設值 | 說明 |
-|---|---|---|
-| `MOCK_MODE` | `true` | `true` 離線 mock / `false` 真實呼叫 Foundry |
-| `RUN_MODE` | `cli` | `server` HTTP 部署 / `cli` 互動命令列 |
-| `OUTPUT_DIR` | `./out` | 產物輸出目錄 |
+```json
+{
+  "preferred_language": "en-US",
+  "raw_input": "I need App Service with private networking in eastasia"
+}
+```
 
-### Foundry 連線
+## 主要環境變數
 
-| 變數 | 預設值 | 說明 |
-|---|---|---|
-| `AZURE_AI_PROJECT_ENDPOINT` | `https://aif-ch-cht-ccoe-ai-agent.services...` | Foundry Project endpoint |
-
-### Agent 名稱
-
-| 變數 | 預設值 | 說明 |
-|---|---|---|
-| `CLARIFICATION_AGENT_NAME` | `Architecture-Clarification-Agent` | 架構澄清 agent |
-| `TERRAFORM_AGENT_NAME` | `Azure-Terraform-Architect-Agent` | Terraform agent |
-| `DIAGRAM_AGENT_NAME` | `DaC-Dagrams-Mingrammer` | Diagram agent |
-| `COST_AGENT_NAME` | `Agent-AzureCalculator` | Cost 結構 agent |
-| `COST_BROWSER_AGENT_NAME` | `Agent-AzureCalculator-BrowserAuto` | Browser mode cost agent |
-
-### 成本估算
+### Core
 
 | 變數 | 預設值 | 說明 |
 |---|---|---|
-| `COST_STEP3B_MODE` | `retail_api` | `retail_api` 本地 Azure Retail Prices API；`browser` Foundry browser agent |
+| `MOCK_MODE` | `true` | `true` 使用 mock agents；`false` 使用 hybrid routing |
+| `RUN_MODE` | `cli` | `cli` 或 `server` |
+| `OUTPUT_DIR` | `./out` | 所有產物輸出目錄 |
+| `PRICING_EXECUTION_MODE` | `retail_api` | `retail_api` 或 `browser` |
 
-### Diagram 渲染
+### Foundry / Agent
 
 | 變數 | 預設值 | 說明 |
 |---|---|---|
-| `RENDER_DIAGRAM` | `true` | 是否啟用本地 `diagram.py` 渲染（需安裝 graphviz） |
-| `RENDER_TIMEOUT` | `60` | diagram subprocess 逾時秒數 |
-| `MAX_FIX_RETRIES` | `3` | diagram import 自動修正最大重試次數 |
+| `AZURE_AI_PROJECT_ENDPOINT` | 範例 endpoint | Foundry project endpoint |
+| `ARCHITECTURE_AGENT_NAME` | `Azure-Architecture-Clarification-Agent` | 架構澄清 agent 名稱 |
+| `TERRAFORM_AGENT_NAME` | `Azure-Terraform-Generation-Agent` | Terraform agent 名稱 |
+| `DIAGRAM_AGENT_NAME` | `Azure-Diagram-Generation-Agent` | Diagram agent 名稱 |
+| `PRICING_STRUCTURE_AGENT_NAME` | `Azure-Pricing-Structure-Agent` | Pricing structure agent 名稱 |
+| `PRICING_BROWSER_AGENT_NAME` | `Azure-Pricing-Browser-Agent` | Browser pricing agent 名稱 |
 
-### Agent 呼叫設定
+### Timeout / Retry
 
 | 變數 | 預設值 | 說明 |
 |---|---|---|
 | `AGENT_MAX_RETRIES` | `2` | Foundry agent 呼叫最大重試次數 |
 | `AGENT_RETRY_DELAY` | `5.0` | 重試間隔秒數 |
-| `AGENT_TIMEOUT` | `120` | 預設 agent HTTP timeout（秒） |
-| `DIAGRAM_AGENT_TIMEOUT` | `300` | Diagram agent 超時（秒） |
-| `TERRAFORM_AGENT_TIMEOUT` | `300` | Terraform agent 超時（秒） |
-| `COST_STRUCTURE_AGENT_TIMEOUT` | `300` | Cost Structure agent 超時（秒） |
-| `COST_BROWSER_AGENT_TIMEOUT` | `600` | Cost Browser agent 超時（秒） |
-| `MAX_AGENT_REGEN_RETRIES` | `2` | Agent 重新生成最大重試次數 |
+| `AGENT_TIMEOUT` | `120` | Foundry agent 預設 timeout |
+| `DIAGRAM_AGENT_TIMEOUT` | `300` | Diagram agent timeout；若未設定 `GITHUB_COPILOT_TIMEOUT`，本地 Copilot diagram agent 也會回退使用此值 |
+| `TERRAFORM_AGENT_TIMEOUT` | `300` | Terraform agent timeout；若未設定 `GITHUB_COPILOT_TIMEOUT`，本地 Copilot terraform agent 也會回退使用此值 |
+| `COST_STRUCTURE_AGENT_TIMEOUT` | `300` | Pricing structure agent timeout |
+| `COST_BROWSER_AGENT_TIMEOUT` | `600` | Browser pricing agent timeout |
+| `GITHUB_COPILOT_TIMEOUT` | `1200` | 本地 Copilot provider timeout；優先於 `DIAGRAM_AGENT_TIMEOUT` / `TERRAFORM_AGENT_TIMEOUT`，未設定且沒有 agent-specific timeout 時也會使用此預設值 |
+| `GITHUB_COPILOT_PROGRESS_TIMEOUT` | `180` | 本地 Copilot 單次 invoke 的卡住偵測上限秒數；若 provider 在此時間內完全沒有完成，會先主動中止並重建 client，再交給既有 retry 機制 |
+| `GITHUB_COPILOT_MAX_RESTARTS` | `1` | 本地 Copilot provider 不健康時，最多重建 client/agent 的次數 |
+| `GITHUB_COPILOT_RETRY_DELAY` | `2.0` | 本地 Copilot provider 重建前的初始等待秒數，後續採 exponential backoff |
+| `GITHUB_COPILOT_STARTUP_PREFLIGHT` | `true` | 在 CLI / server 啟動時先驗證本地 Copilot provider 是否可用；`MOCK_MODE=true` 時自動跳過 |
+| `GITHUB_COPILOT_WORKDIR` | 未設定時使用目前程序工作目錄 | 強制 GitHub Copilot SDK 以指定目錄啟動；相對路徑會相對於啟動程序當下目錄解析，且會自動建立，例如 `out` |
 
-### Terraform 驗證
+> 本地 Copilot 多輪 session 會持久化到 `OUTPUT_DIR/.copilot_sessions/`。若程序重啟，只要 workflow checkpoint 還保留同一個 `response_id`（本地 Copilot 路徑實際上是 session id），續輪時會自動從磁碟恢復對話歷史。
+>
+> Session payload 現在除了 `turns` 之外，還會持久化 `events`，記錄 preflight、attempt、stuck timeout、retry、最終完成或失敗等執行軌跡。即使本次 invoke 尚未成功回傳最終文字，也會先把事件寫進 `OUTPUT_DIR/.copilot_sessions/`，方便事後檢查。
+>
+> 本地 Copilot provider 會輸出 `[CopilotHealth]` 結構化 log，並寫出 OTel metrics：健康事件、client/agent 重建次數、preflight/invoke latency。若有 Application Insights，這些訊號會跟著既有 telemetry 一起匯出。
+
+### Diagram / Terraform 驗證
 
 | 變數 | 預設值 | 說明 |
 |---|---|---|
-| `TF_VALIDATE_ENABLED` | `true` | 是否啟用 Terraform validate 檢查 |
-| `MAX_TF_VALIDATE_RETRIES` | `2` | Terraform validate 失敗重試次數 |
+| `RENDER_DIAGRAM` | `true` | 是否渲染 `diagram.py` |
+| `RENDER_TIMEOUT` | `60` | diagram subprocess timeout |
+| `MAX_FIX_RETRIES` | `3` | import auto-fix 最大重試次數 |
+| `MAX_AGENT_REGEN_RETRIES` | `2` | 將 render error 回傳 diagram agent 的重試次數 |
+| `TF_VALIDATE_ENABLED` | `true` | 是否執行 Terraform validate |
+| `MAX_TF_VALIDATE_RETRIES` | `2` | validate 失敗時回傳 agent 修復的重試次數 |
 
-### 可觀測性
+### Observability
 
 | 變數 | 預設值 | 說明 |
 |---|---|---|
-| `APPLICATIONINSIGHTS_CONNECTION_STRING` | *(空)* | Application Insights 連線字串（未設定則不匯出） |
-| `OTEL_SERVICE_NAME` | `ccoe-orchestrator` | OpenTelemetry 服務名稱 |
-| `OTEL_SAMPLING_RATIO` | `1.0` | Traces 取樣率 |
+| `APPLICATIONINSIGHTS_CONNECTION_STRING` | 空值 | 設定後匯出 telemetry 到 Application Insights |
+| `OTEL_SERVICE_NAME` | `ccoe-orchestrator` | OTel service name |
+| `OTEL_SAMPLING_RATIO` | `1.0` | trace sampling ratio |
 
----
+## Agent 定義同步
 
-## Agent 定義同步 (agent_sync)
-
-使用 `agent_sync.py` 在本地 YAML 與 Microsoft Foundry 之間同步 agent 定義：
+`agent_sync.py` 可在本地 YAML 與 Foundry agent definition/version 間同步。
 
 ```bash
-# 從 Foundry 拉取所有 agent 定義 → prompts/*.yaml
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+
+# 拉取全部 agent 定義
 python -m orchestrator_app.agent_sync pull
 
-# 拉取指定 agent
-python -m orchestrator_app.agent_sync pull Architecture-Clarification-Agent
+# 拉取單一 agent
+python -m orchestrator_app.agent_sync pull Azure-Architecture-Clarification-Agent
 
-# 推送所有本地 YAML → Foundry（draft → publish）
+# 推送全部 agent 定義
 python -m orchestrator_app.agent_sync push
 
-# 只更新 draft，不 publish
-python -m orchestrator_app.agent_sync push Agent-AzureCalculator --no-publish
+# 推送單一 agent
+python -m orchestrator_app.agent_sync push Azure-Pricing-Structure-Agent
 ```
 
-YAML 採用 Microsoft Agent Framework declarative 格式，存放於 `prompts/` 目錄。
+補充：
 
----
+- runtime 一律以 `prompts/` 底下的 YAML 為本地 source of truth。
+- hybrid 模式下，Terraform / Diagram 的 prompt 也直接由本地 YAML 載入。
+- 若 Foundry 端仍保留某些 hosted agents，修改 YAML 後可再 push 建立新 version。
 
 ## 專案結構
 
-```
+```text
 ccoe-Orchestrator/
-├── Dockerfile                    # 容器化部署
-├── pyproject.toml                # pytest 設定
+├── .env.example
+├── Dockerfile
 ├── README.md
-├── requirements.txt              # Python 依賴
-│
-├── prompts/                      # Agent 定義 YAML（Foundry declarative 格式）
-│   ├── Agent-AzureCalculator.yaml
+├── README.en.md
+├── pyproject.toml
+├── requirements.txt
+├── prompts/
 │   ├── Agent-AzureCalculator-BrowserAuto.yaml
+│   ├── Agent-AzureCalculator.yaml
 │   ├── Architecture-Clarification-Agent.yaml
+│   ├── Azure-Architecture-Clarification-Agent.yaml
+│   ├── Azure-Diagram-Generation-Agent.yaml
+│   ├── Azure-Pricing-Browser-Agent.yaml
+│   ├── Azure-Pricing-Structure-Agent.yaml
 │   ├── Azure-Terraform-Architect-Agent.yaml
+│   ├── Azure-Terraform-Generation-Agent.yaml
 │   └── DaC-Dagrams-Mingrammer.yaml
-│
-├── src/
-│   └── orchestrator_app/
-│       ├── main.py               # Entrypoint — build_workflow() + HTTP Server + CLI 互動迴圈
-│       ├── contracts.py          # Pydantic 資料模型（Spec, ResourceManifest, WorkflowResult 等）
-│       ├── executors.py          # MAF Executor 實作（9 個 workflow 步驟 + 內部子 executor）
-│       ├── foundry_agents.py     # 真實 Foundry agent 呼叫 + prompt builders
-│       ├── mock_agents.py        # Mock mode 替代方案（離線測試用）
-│       ├── agent_sync.py         # Foundry Agent 定義 ↔ 本地 YAML 同步（pull / push）
-│       ├── diagram_renderer.py   # 本地渲染 diagram.py → PNG + auto-fix import 錯誤
-│       ├── retail_prices.py      # Azure Retail Prices REST API 查詢（免費、無需驗證）
-│       ├── xlsx_builder.py       # 將定價資料組合成 estimate.xlsx
-│       ├── io.py                 # 產物寫入（spec / diagram / tf / cost / summary）
-│       └── observability.py      # Azure Monitor + OpenTelemetry 可觀測性設定
-│
+├── skills/
+│   └── terraform/
+│       ├── azure-verified-modules.md
+│       ├── terraform-style-guide.md
+│       └── terraform-test.md
+├── src/orchestrator_app/
+│   ├── agent_sync.py
+│   ├── contracts.py
+│   ├── copilot_local_agents.py
+│   ├── diagram_renderer.py
+│   ├── executors.py
+│   ├── foundry_agents.py
+│   ├── hybrid_agents.py
+│   ├── i18n.py
+│   ├── io.py
+│   ├── main.py
+│   ├── mock_agents.py
+│   ├── observability.py
+│   ├── repair_feedback.py
+│   ├── retail_prices.py
+│   └── xlsx_builder.py
 └── tests/
-    ├── test_agent_sync.py        # agent_sync 模組測試
-    ├── test_diagram_regen.py     # diagram 重新生成測試
-    ├── test_retail_prices.py     # retail_prices 模組單元測試
-    └── test_workflow.py          # E2E Workflow 測試（MOCK_MODE=true）
+    ├── test_agent_sync.py
+    ├── test_diagram_regen.py
+    ├── test_diagram_renderer_agent.py
+    ├── test_hybrid_agents.py
+    ├── test_retail_prices.py
+    └── test_workflow.py
 ```
 
----
+### 模組說明
 
-## 交付物清單
+| 檔案 | 用途 |
+|---|---|
+| `main.py` | workflow 建構、CLI 入口、HTTP server 入口 |
+| `executors.py` | 主要 workflow steps 與 shared state 控制 |
+| `contracts.py` | Pydantic data contracts |
+| `foundry_agents.py` | Foundry Responses API 呼叫與輸出解析 |
+| `copilot_local_agents.py` | 本地 GitHub Copilot provider prompt agents |
+| `hybrid_agents.py` | Copilot / Foundry 路由邏輯 |
+| `diagram_renderer.py` | `diagram.py` 渲染、import 修復與回饋 |
+| `retail_prices.py` | Azure Retail Prices API 查詢 |
+| `xlsx_builder.py` | 成本估算 Excel 產生 |
+| `repair_feedback.py` | Diagram / Terraform 修復 prompt 的回饋上下文 |
+| `io.py` | 統一輸出檔案與 zip 打包 |
+| `observability.py` | Azure Monitor + OpenTelemetry 設定 |
 
-執行成功後，`OUTPUT_DIR/` 產出以下檔案：
+## 產物輸出
 
-```
+成功執行後，所有產物會寫入 `OUTPUT_DIR`：
+
+```text
 out/
-├── spec.json                     # 需求規格（含 architecture_details）
-│
-├── diagram.py                    # Diagrams as Code 原始碼
-├── diagram.png (或 .svg)         # 渲染後的架構圖
-├── render_log.txt                # diagram subprocess 執行日誌
-│
-├── terraform/                    # Terraform IaC 產物
-│   ├── main.tf
-│   ├── variables.tf
-│   ├── outputs.tf
-│   ├── locals.tf
-│   ├── versions.tf
-│   └── providers.tf
-│
-├── resource_manifest.json        # 機器可讀資源清單
-├── cost_structure.json           # Agent-AzureCalculator 成本結構
-├── estimate.xlsx                 # 逐項定價表（Azure Retail Prices API）
-├── calculator_share_url.txt      # Azure Calculator 分享連結（browser mode 時產出）
-└── executive_summary.md          # 管理層摘要
+├── spec.json
+├── diagram.py
+├── diagram.png / diagram.svg
+├── render_log.txt
+├── resource_manifest.json
+├── pricing_structure.json
+├── estimate.xlsx
+├── calculator_share_url.txt
+├── executive_summary.md
+├── artifacts.zip
+└── terraform/
+    ├── main.tf
+    ├── variables.tf
+    ├── outputs.tf
+    ├── locals.tf
+    ├── versions.tf
+    ├── providers.tf
+    ├── README.md
+    ├── terragrunt.hcl
+    ├── envs/dev/terragrunt.hcl
+    ├── envs/prod/terragrunt.hcl
+    └── tests/
 ```
-
----
-
-## Workflow 行為規則
-
-| # | 規則 | 說明 |
-|---|---|---|
-| 1 | **Orchestrator 不生成內容** | Terraform / Diagram / Cost 全部委派給 specialist agents |
-| 2 | **架構澄清先行** | Architecture-Clarification-Agent 確認 10 個維度後，diagram 才有完整輸入 |
-| 3 | **Diagram 先於 Terraform** | 使用者確認架構圖後，才並行呼叫 Terraform + Cost，避免 IaC 重做 |
-| 4 | **Diagram Approval Gate** | `DiagramApprovalExecutor` 等待使用者輸入 `approve` / `revise` / `reject` |
-| 5 | **Step 7 並行執行** | `ParallelTerraformCostExecutor` 同時呼叫 Terraform 與 Cost Structure Agent |
-| 6 | **Diagram auto-fix** | 渲染失敗時自動查找 `diagrams` 套件並修正 import 錯誤，最多重試 `MAX_FIX_RETRIES` 次 |
-| 7 | **Assumptions 自動填補** | 未指定欄位用預設值，記錄在 `spec.json` 的 `assumptions` 陣列 |
-| 8 | **Cost Step 模式** | `retail_api`（預設）走本地 API；`browser` 走 Foundry `browser_automation_preview` |
-| 9 | **Multi-turn 支援** | `ctx.request_info()` 暫停 workflow；CLI 從 stdin 讀取；HTTP 由 hosting adapter 處理 |
-
----
-
-## 可觀測性 (Observability)
-
-整合 **Azure Monitor + OpenTelemetry**，提供 traces / metrics / logs 匯出：
-
-- 設定 `APPLICATIONINSIGHTS_CONNECTION_STRING` 啟用 Application Insights 匯出
-- Agent Framework 內建 OTel instrumentation 自動追蹤 Responses API spans
-- 共用 `tracer` / `meter` 供所有 executors 與 foundry_agents 使用
-- 未設定連線字串時，仍可用 NoOp tracer 正常運行（不匯出遙測資料）
-
----
 
 ## 測試
 
 ```bash
-# 執行所有測試
-pytest
-
-# 執行指定測試
+source .venv/bin/activate
+export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
+pytest -q
 pytest tests/test_workflow.py -v
-
-# 執行 retail prices 單元測試
-pytest tests/test_retail_prices.py -v
+pytest tests/test_diagram_regen.py tests/test_diagram_renderer_agent.py tests/test_agent_sync.py -q
 ```
 
-測試預設使用 `MOCK_MODE=true`，不需要 Foundry 連線。
+測試主要以 `MOCK_MODE=true` 為前提，不需連到 Foundry。
 
----
+## Docker
 
-## Docker 部署
-
-### 建置與執行
+### 建置
 
 ```bash
-# 建置映像
 docker build -t ccoe-orchestrator .
+```
 
-# 執行容器
+### 執行
+
+```bash
 docker run -p 8088:8088 \
+  -e RUN_MODE=server \
   -e MOCK_MODE=false \
-  -e AZURE_AI_PROJECT_ENDPOINT=https://your-foundry-endpoint.services.ai.azure.com/api/... \
+  -e AZURE_AI_PROJECT_ENDPOINT="https://<your-project>.services.ai.azure.com/api/projects/<project-name>" \
+  -e GITHUB_COPILOT_MODEL="gpt-5.4" \
   ccoe-orchestrator
 ```
 
-### 容器規格
+Docker image 特色：
 
-- 基底映像：`python:3.12-slim`
-- 內建 `graphviz`（diagram 渲染）
-- 健康檢查：`GET /health`（每 30 秒）
-- 預設埠號：`8088`
-- 預設模式：`RUN_MODE=server`、`MOCK_MODE=false`
-
----
+- 基底映像為 `python:3.12-slim`
+- 內含 `graphviz`
+- 預設 `PYTHONPATH=/app/src`
+- 預設 `RUN_MODE=server`
+- 預設埠 `8088`
 
 ## 技術棧
 
-| 元件 | 技術 |
+| 項目 | 技術 |
 |---|---|
-| Agent 框架 | Microsoft Agent Framework (MAF) 1.0.0rc2 |
-| AI 平台 | Microsoft Foundry (Azure AI Projects SDK) |
-| 資料模型 | Pydantic v2 |
-| HTTP Server | MAF Hosting Adapter (ASGI) |
-| 可觀測性 | OpenTelemetry + Azure Monitor |
-| IaC 產出 | Terraform (AVM) + Terragrunt |
-| Diagram 產出 | [diagrams](https://diagrams.mingrammer.com/) (Python) |
-| 成本估算 | Azure Retail Prices REST API / Browser Automation |
-| 容器化 | Docker |
-
----
-
-## License
-
-Internal use only — CCoE Team.
-
-## 部署到 Foundry Hosted Agents
-
-1. 在 Azure AI Foundry 中建立 Hosted Agent 資源
-2. 設定 Container Image 指向此 Docker image
-3. 設定環境變數 (`MOCK_MODE=false`, `AZURE_AI_PROJECT_ENDPOINT`, etc.)
-4. 確認下列 **5 個 specialist agents** 在同一個 Foundry Project 中：
-   - `Architecture-Clarification-Agent`（`CLARIFICATION_AGENT_NAME`）
-   - `DaC-Dagrams-Mingrammer`（`DIAGRAM_AGENT_NAME`）
-   - `Azure-Terraform-Architect-Agent`（`TERRAFORM_AGENT_NAME`）
-   - `Agent-AzureCalculator`（`COST_AGENT_NAME`）
-   - `Agent-AzureCalculator-BrowserAuto`（`COST_BROWSER_AGENT_NAME`，`COST_STEP3B_MODE=browser` 時使用）
-5. 部署後通過 Foundry Portal 或 API 進行互動
-
-### Architecture-Clarification-Agent 設定
-
-在 [Azure AI Foundry Portal](https://aif-ch-cht-ccoe-ai-agent.services.ai.azure.com/api/projects/ArchitectAgent) 確認 Hosted Agent 設定：
-
-- **Agent 名稱**：`Architecture-Clarification-Agent`（或自訂後更新 `CLARIFICATION_AGENT_NAME`）
-- **System Prompt**：由 `foundry_agents.build_architecture_clarification_prompt()` 產生的內容定義其行為
-- **能力**：多輪對話，確認 10 個架構維度，最終輸出 JSON 格式的 `architecture_details`
-
-## 測試
-
-```bash
-# 執行所有測試
-pytest tests/ -v
-
-# E2E Workflow（mock mode）
-MOCK_MODE=true pytest tests/test_workflow.py -v
-
-# Azure Retail Prices 模組單元測試
-pytest tests/test_retail_prices.py -v
-```
-
-> `test_workflow.py` — 驗證完整 9 步 executor 串接流程（mock agents）  
-> `test_retail_prices.py` — 驗證 `retail_prices.py` 的 OData filter 產生與 API 回應解析
+| Agent framework | Microsoft Agent Framework |
+| LLM backend | GitHub Copilot provider + Microsoft Foundry |
+| Data contracts | Pydantic v2 |
+| Pricing | Azure Retail Prices API / browser automation |
+| Diagram | `diagrams` + Graphviz |
+| Observability | OpenTelemetry + Azure Monitor |
+| Testing | pytest + pytest-asyncio |
 
 ## License
 

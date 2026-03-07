@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import DiagramOutput, StepStatus
+from .io import ensure_output_dir
 
 logger = logging.getLogger(__name__)
 
@@ -941,10 +942,10 @@ async def render_diagram_locally(
 try:
     from agent_framework import (
         BaseAgent,
-        AgentRunResponse,
-        AgentRunResponseUpdate,
-        AgentThread,
-        ChatMessage,
+        AgentResponse,
+        AgentResponseUpdate,
+        AgentSession,
+        Message,
     )
 
     class DiagramRendererAgent(BaseAgent):
@@ -957,21 +958,21 @@ try:
 
         def __init__(self, name: str = "diagram-renderer", output_dir: Path | None = None, **kwargs):
             super().__init__(name=name, **kwargs)
-            self._output_dir = output_dir or Path(os.getenv("OUTPUT_DIR", "./out"))
+            self._output_dir = ensure_output_dir(output_dir)
 
         async def run(
             self,
-            messages: ChatMessage | list[ChatMessage] | None = None,
+            messages: Any = None,
             *,
-            thread: AgentThread | None = None,
+            session: AgentSession | None = None,
             **kwargs,
-        ) -> AgentRunResponse:
+        ) -> AgentResponse:
             """Non-streaming: 接收 diagram.py 原始碼，執行渲染，回傳結果。"""
             diagram_py = self._extract_diagram_code(messages)
 
             if not diagram_py.strip():
-                return AgentRunResponse(
-                    messages=[{"role": "assistant", "content": "❌ No diagram.py code provided."}],
+                return AgentResponse(
+                    messages=[Message(role="assistant", text="❌ No diagram.py code provided.")],
                 )
 
             result = await render_diagram_locally(diagram_py, self._output_dir)
@@ -994,52 +995,61 @@ try:
                     f"**Render Log**:\n```\n{result.render_log}\n```"
                 )
 
-            return AgentRunResponse(
-                messages=[{"role": "assistant", "content": response_text}],
+            return AgentResponse(
+                messages=[Message(role="assistant", text=response_text)],
             )
 
-        def run_stream(
+        async def run_stream(
             self,
-            messages: ChatMessage | list[ChatMessage] | None = None,
+            messages: Any = None,
             *,
-            thread: AgentThread | None = None,
+            session: AgentSession | None = None,
             **kwargs,
         ):
             """Streaming: yield 渲染進度。"""
             diagram_py = self._extract_diagram_code(messages)
 
             async def _stream():
-                yield AgentRunResponseUpdate(text="🖼️ Diagram Renderer Agent 啟動...\n")
+                yield AgentResponseUpdate(role="assistant", contents=["🖼️ Diagram Renderer Agent 啟動...\n"])
 
                 gv_ok, gv_msg = _check_graphviz()
-                yield AgentRunResponseUpdate(text=f"  Pre-flight: {gv_msg}\n")
+                yield AgentResponseUpdate(role="assistant", contents=[f"  Pre-flight: {gv_msg}\n"])
 
                 if not gv_ok:
-                    yield AgentRunResponseUpdate(text=f"❌ {gv_msg}\n")
+                    yield AgentResponseUpdate(role="assistant", contents=[f"❌ {gv_msg}\n"])
                     return
 
                 pkg_ok, pkg_msg = _check_diagrams_package()
-                yield AgentRunResponseUpdate(text=f"  Pre-flight: {pkg_msg}\n")
+                yield AgentResponseUpdate(role="assistant", contents=[f"  Pre-flight: {pkg_msg}\n"])
 
                 if not pkg_ok:
-                    yield AgentRunResponseUpdate(text=f"❌ {pkg_msg}\n")
+                    yield AgentResponseUpdate(role="assistant", contents=[f"❌ {pkg_msg}\n"])
                     return
 
-                yield AgentRunResponseUpdate(text="🔄 Executing diagram.py...\n")
+                yield AgentResponseUpdate(role="assistant", contents=["🔄 Executing diagram.py...\n"])
                 result = await render_diagram_locally(diagram_py, self._output_dir)
 
                 if result.status == StepStatus.SUCCESS and result.diagram_image:
-                    yield AgentRunResponseUpdate(
-                        text=f"✅ Rendered: diagram.{result.diagram_image_ext} "
-                             f"({len(result.diagram_image)} bytes)\n"
+                    yield AgentResponseUpdate(
+                        role="assistant",
+                        contents=[
+                            f"✅ Rendered: diagram.{result.diagram_image_ext} "
+                            f"({len(result.diagram_image)} bytes)\n"
+                        ],
                     )
                 else:
-                    yield AgentRunResponseUpdate(
-                        text=f"{'⚠️' if result.status == StepStatus.SUCCESS else '❌'} "
-                             f"{result.error or 'Completed'}\n"
+                    yield AgentResponseUpdate(
+                        role="assistant",
+                        contents=[
+                            f"{'⚠️' if result.status == StepStatus.SUCCESS else '❌'} "
+                            f"{result.error or 'Completed'}\n"
+                        ],
                     )
 
-                yield AgentRunResponseUpdate(text=f"\nRender Log:\n{result.render_log}\n")
+                yield AgentResponseUpdate(
+                    role="assistant",
+                    contents=[f"\nRender Log:\n{result.render_log}\n"],
+                )
 
             return _stream()
 

@@ -151,7 +151,7 @@ def build_estimate_xlsx(
     free_count = sum(1 for pi in priced_items if pi.source == "free")
     attr_cell.value = (
         f"Pricing sources: {api_count} from Azure Retail Prices API, "
-        f"{llm_count} from LLM estimate (Step 3a), {free_count} free resources. "
+        f"{llm_count} from LLM estimate (Step 7B), {free_count} free resources. "
         f"Prices as of {now}. Actual costs may vary."
     )
     attr_cell.font = Font(size=9, italic=True, color="808080")
