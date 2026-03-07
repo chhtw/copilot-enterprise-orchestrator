@@ -70,6 +70,7 @@ class TestHybridAgents:
         from orchestrator_app import executors
 
         calls: list[tuple[str, str | None]] = []
+        monkeypatch.setattr(executors, "TERRAFORM_GENERATION_MODE", "single")
 
         async def fake_invoke(agent_name: str, message: str, *, previous_response_id: str | None = None, **kwargs):
             calls.append((message, previous_response_id))
@@ -115,6 +116,7 @@ class TestHybridAgents:
     @pytest.mark.asyncio
     async def test_parallel_terraform_raises_clear_error_when_still_nonfinal(self, monkeypatch):
         from orchestrator_app import executors
+        monkeypatch.setattr(executors, "TERRAFORM_GENERATION_MODE", "single")
 
         async def fake_invoke(agent_name: str, message: str, *, previous_response_id: str | None = None, **kwargs):
             return "我還需要更多資訊才能產生 Terraform。", "rid-1"
@@ -127,3 +129,88 @@ class TestHybridAgents:
                 '{"preferred_language":"zh-TW","project_name":"demo"}',
                 '{"resources":[]}',
             )
+
+    @pytest.mark.asyncio
+    async def test_parallel_terraform_staged_generation_aggregates_bundles(self, monkeypatch):
+        from orchestrator_app import executors
+
+        monkeypatch.setattr(executors, "TERRAFORM_GENERATION_MODE", "staged")
+        calls: list[str] = []
+
+        async def fake_invoke(agent_name: str, message: str, *, previous_response_id: str | None = None, **kwargs):
+            calls.append(message)
+            if "Current bundle: foundation" in message:
+                return json.dumps({
+                    "versions_tf": "terraform {}",
+                    "providers_tf": "provider \"azurerm\" {}",
+                    "locals_tf": "locals {}",
+                    "variables_tf": "variable \"project_name\" {}",
+                    "resource_manifest": {
+                        "project_name": "demo",
+                        "resources": [],
+                        "terraform_version": "1.9.0",
+                        "provider_version": "4.0.0",
+                    },
+                }), "rid-foundation"
+            if "Current bundle: main" in message:
+                return json.dumps({
+                    "main_tf": "resource \"azurerm_resource_group\" \"rg\" {}",
+                    "outputs_tf": "output \"rg_name\" {}",
+                }), "rid-main"
+            if "Current bundle: ops" in message:
+                return json.dumps({
+                    "terragrunt_root_hcl": "remote_state {}",
+                    "terragrunt_dev_hcl": "include {}",
+                    "terragrunt_prod_hcl": "include {}",
+                    "readme_md": "# demo",
+                    "test_files": {
+                        "unit_basic.tftest.hcl": "run \"plan\" {}",
+                    },
+                }), "rid-ops"
+            raise AssertionError(f"unexpected message: {message[:120]}")
+
+        monkeypatch.setattr(executors.agents, "invoke_agent_raw", fake_invoke)
+        monkeypatch.setattr(
+            executors.agents,
+            "classify_response",
+            lambda text, expected_schema=None: "final" if text.lstrip().startswith("{") else "question",
+        )
+
+        result = await executors._invoke_parallel_terraform_generation(
+            '{"preferred_language":"zh-TW","project_name":"demo"}',
+            '{"resources":[]}',
+        )
+
+        assert result.status.value == "success"
+        assert result.main_tf.startswith("resource")
+        assert result.versions_tf.startswith("terraform")
+        assert result.readme_md == "# demo"
+        assert "unit_basic.tftest.hcl" in result.test_files
+        assert len(calls) == 3
+
+    def test_build_terraform_stage_prompt_uses_compact_ops_context(self):
+        from orchestrator_app import executors
+
+        prompt = executors._build_terraform_stage_prompt(
+            spec_json='{"preferred_language":"zh-TW","project_name":"demo"}',
+            approved_manifest_json='{"resources":[]}',
+            stage_name='ops',
+            description='terragrunt wrappers, README, and terraform tests',
+            required_keys=['terragrunt_root_hcl', 'readme_md', 'test_files'],
+            completed_payloads={
+                'foundation': {
+                    'variables_tf': 'variable "project_name" {}\nvariable "environment" {}',
+                    'providers_tf': 'provider "azurerm" {}',
+                    'resource_manifest': {'resources': [{'resource_type': 'azurerm_resource_group', 'name': 'rg'}]},
+                },
+                'main': {
+                    'main_tf': 'resource "azurerm_resource_group" "rg" {}\nresource "azurerm_storage_account" "st" {}',
+                    'outputs_tf': 'output "rg_name" {}',
+                },
+            },
+        )
+
+        assert 'completed_bundles_context.json' in prompt
+        assert 'foundation_summary' in prompt
+        assert 'main_summary' in prompt
+        assert 'resource "azurerm_resource_group" "rg" {}' not in prompt

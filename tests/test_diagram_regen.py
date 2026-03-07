@@ -415,6 +415,7 @@ class TestRenderWithAgentRegen:
     async def test_success_after_one_regen(self, sample_diag_output, tmp_output_dir):
         """首次渲染失敗 → agent regen → 第二次渲染成功。"""
         mock_ctx = _make_mock_ctx()
+        mock_ctx.get_state = MagicMock(side_effect=lambda key: "thread-existing" if key == "diag_response_id" else KeyError)
         failed_result = _make_failed_render_result(code='from diagrams import Diagram\nprint("autofixed")', error="ImportError: cannot import name 'Foo'")
         failed_result.render_log = "[Render] FAILED\n[AutoFix] changed import"
         success_result = _make_success_render_result()
@@ -452,12 +453,14 @@ class TestRenderWithAgentRegen:
         assert result.diagram_image == b"\x89PNG_FAKE"
         # Agent 被呼叫一次
         mock_agents_mod.invoke_agent_raw.assert_awaited_once()
+        assert mock_agents_mod.invoke_agent_raw.await_args.kwargs["previous_response_id"] == "thread-existing"
         mock_agents_mod.build_diagram_regen_prompt.assert_called_once()
         regen_kwargs = mock_agents_mod.build_diagram_regen_prompt.call_args.kwargs
         assert regen_kwargs["previous_diagram_py"] == 'from diagrams import Diagram\nprint("autofixed")'
         assert regen_kwargs["render_log"] == "[Render] FAILED\n[AutoFix] changed import"
         manifest_payload = json.loads(regen_kwargs["previous_approved_resource_manifest_json"])
         assert manifest_payload["project_name"] == "test"
+        mock_ctx.set_state.assert_any_call("diag_response_id", "thread-1")
         # render_diagram_locally 共被呼叫兩次（初次 + regen 後）
         assert mock_render.await_count == 2
         # 有向使用者輸出 regen 訊息

@@ -1,3 +1,4 @@
+- 將所有產物集中寫入 `out/`；只有明確開啟 override 時才會使用自訂 `OUTPUT_DIR`
 # Azure Platform Orchestrator
 
 [English version](README.en.md)
@@ -97,6 +98,14 @@ MOCK_MODE=true
 RUN_MODE=cli
 OUTPUT_DIR=./out
 PRICING_EXECUTION_MODE=retail_api
+
+# 只有在測試或隔離執行時，才明確允許覆寫輸出目錄
+# ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE=true
+| `OUTPUT_DIR` | `./out` | 自訂輸出目錄；只有搭配 `ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE=true` 才會生效 |
+| `ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE` | 未設定 | 顯式允許使用 `OUTPUT_DIR` 覆寫預設 `./out`；建議只用於測試或隔離執行 |
+> 本地 Copilot 多輪 session 預設會持久化到 `out/.copilot_sessions/`。若啟用 `ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE=true`，則會改寫到對應的 `OUTPUT_DIR/.copilot_sessions/`。若程序重啟，只要 workflow checkpoint 還保留同一個 `response_id`（本地 Copilot 路徑實際上是 session id），續輪時會自動從磁碟恢復對話歷史。
+> Session payload 現在除了 `turns` 之外，還會持久化 `events`，記錄 preflight、attempt、串流 progress、stuck timeout、overall timeout、retry、最終完成或失敗等執行軌跡。即使本次 invoke 尚未成功回傳最終文字，也會先把事件寫進預設的 `out/.copilot_sessions/`；若明確啟用 override，才會寫進 `OUTPUT_DIR/.copilot_sessions/`，方便事後檢查。
+成功執行後，所有產物預設會寫入 `out/`；只有明確啟用 override 時才會改寫到 `OUTPUT_DIR`：
 ```
 
 ### 3. Mock Mode

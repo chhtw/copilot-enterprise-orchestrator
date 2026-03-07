@@ -307,7 +307,9 @@ class TestCopilotLocalAgents:
 
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
+        monkeypatch.setenv("ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE", "true")
         monkeypatch.setenv("GITHUB_COPILOT_MAX_RESTARTS", "0")
+        monkeypatch.setenv("ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE", "true")
         monkeypatch.setattr(mod, "_get_copilot_auth_status", fake_auth_status)
         monkeypatch.setattr(mod, "CopilotClient", FakeCopilotClient)
         monkeypatch.setattr(mod, "GitHubCopilotAgent", FakeGitHubCopilotAgent)
@@ -446,8 +448,10 @@ class TestCopilotLocalAgents:
 
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("OUTPUT_DIR", str(tmp_path / "out"))
+        monkeypatch.setenv("ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE", "true")
         monkeypatch.setenv("GITHUB_COPILOT_MAX_RESTARTS", "0")
         monkeypatch.setenv("GITHUB_COPILOT_PROGRESS_TIMEOUT", "0.02")
+        monkeypatch.setenv("ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE", "true")
         monkeypatch.setattr(mod, "_get_copilot_auth_status", fake_auth_status)
         monkeypatch.setattr(mod, "CopilotClient", FakeCopilotClient)
         monkeypatch.setattr(mod, "GitHubCopilotAgent", FakeGitHubCopilotAgent)

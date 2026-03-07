@@ -128,6 +128,20 @@ instructions: |
 
   > 上表中的 `/src/workload/...` 與 `/envs/...` 是回傳內容對應的虛擬專案結構；Orchestrator 最終會將它們寫入 `./out/terraform/` 與 `./out/resource_manifest.json`。
 
+  ### 分段輸出模式（Staged Bundle Mode）
+
+  若使用者 prompt 明確指定 `Execution mode: staged_bundle`，代表 Orchestrator 正在分段收集 Terraform 專案內容，
+  以降低單次生成的輸出體積與執行時間。
+
+  在此模式下你必須遵守以下規則：
+
+  1. **只輸出目前 bundle 要求的 keys**：依 `bundle_required_keys` 清單回傳，未列出的 key 一律不要輸出。
+  2. **仍然只回傳單一 JSON 物件**：不得加入任何前言、解釋或 Markdown 小節。
+  3. **延續相同的硬性規則**：AVM 優先、private network、RBAC、Tags/Naming、Terragrunt、Terraform tests 的規則仍然成立。
+  4. **尊重已完成 bundles**：若 prompt 提供 `completed_bundles.json`，代表那些內容已被接受；除非本 bundle 明確需要依賴它們，否則不要重新定義或覆寫其他 bundle 的 keys。
+  5. **resource_manifest 仍是完整物件**：若本 bundle 要求 `resource_manifest`，必須回傳完整的 manifest 物件，而不是片段。
+  6. **不要追問使用者**：若資訊缺漏，採用最小合理假設並在本 bundle 可用的欄位中反映。
+
   ---
 
   ## 驗證修正模式（Validation Fix Mode）

@@ -1,3 +1,4 @@
+- Writes all artifacts into `out/`; a custom `OUTPUT_DIR` is used only when override is explicitly enabled
 # Azure Platform Orchestrator
 
 [繁體中文版本](README.md)
@@ -97,6 +98,12 @@ MOCK_MODE=true
 RUN_MODE=cli
 OUTPUT_DIR=./out
 PRICING_EXECUTION_MODE=retail_api
+
+# Only enable this for tests or isolated runs
+# ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE=true
+| `OUTPUT_DIR` | `./out` | Custom output directory; only honored when `ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE=true` |
+| `ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE` | unset | Explicitly allows overriding the default `./out`; recommended only for tests or isolated runs |
+On success, all runtime outputs are written into `out/` by default; only explicit override mode redirects them to `OUTPUT_DIR`:
 ```
 
 ### 3. Mock Mode

@@ -86,6 +86,7 @@ MAX_AGENT_REGEN_RETRIES = int(os.getenv("MAX_AGENT_REGEN_RETRIES", "2"))
 TF_VALIDATE_ENABLED = os.getenv("TF_VALIDATE_ENABLED", "true").lower() in ("true", "1", "yes")
 MAX_TF_VALIDATE_RETRIES = int(os.getenv("MAX_TF_VALIDATE_RETRIES", "2"))
 MAX_TERRAFORM_NONFINAL_RETRIES = int(os.getenv("MAX_TERRAFORM_NONFINAL_RETRIES", "1"))
+TERRAFORM_GENERATION_MODE = os.getenv("TERRAFORM_AGENT_GENERATION_MODE", "staged").lower().strip()
 
 # ─── Pricing execution mode: "retail_api" (local API) or "browser" (Foundry browser_automation_preview) ───
 PRICING_EXECUTION_MODE = os.getenv("PRICING_EXECUTION_MODE", "retail_api").lower().strip()
@@ -102,6 +103,7 @@ else:
 ARCHITECTURE_AGENT = os.getenv("ARCHITECTURE_AGENT_NAME", "Azure-Architecture-Clarification-Agent")
 TERRAFORM_AGENT = os.getenv("TERRAFORM_AGENT_NAME", "Azure-Terraform-Generation-Agent")
 DIAGRAM_AGENT = os.getenv("DIAGRAM_AGENT_NAME", "Azure-Diagram-Generation-Agent")
+DIAGRAM_REVIEW_AGENT = os.getenv("DIAGRAM_REVIEW_AGENT_NAME", "Diagram-Review")
 PRICING_STRUCTURE_AGENT = os.getenv("PRICING_STRUCTURE_AGENT_NAME", "Azure-Pricing-Structure-Agent")
 PRICING_BROWSER_AGENT = os.getenv("PRICING_BROWSER_AGENT_NAME", "Azure-Pricing-Browser-Agent")
 
@@ -132,6 +134,7 @@ KEY_TF_OUTPUT = "tf_output"
 KEY_RESOURCE_MANIFEST_JSON = "resource_manifest_json"
 KEY_APPROVED_RESOURCE_MANIFEST_JSON = "approved_resource_manifest_json"
 KEY_DIAG_OUTPUT = "diag_output"
+KEY_DIAG_RESPONSE_ID = "diag_response_id"
 KEY_DIAGRAM_APPROVED = "diagram_approved"
 KEY_PRICING_STRUCTURE = "pricing_structure"
 KEY_PRICING_STRUCTURE_JSON = "pricing_structure_json"
@@ -168,6 +171,274 @@ def _ctx_language(ctx: _Ctx) -> str:
         return normalize_language(ctx.get_state(KEY_PREFERRED_LANGUAGE))
     except KeyError:
         return DEFAULT_LANGUAGE
+
+
+_TERRAFORM_STAGE_BUNDLES: tuple[dict[str, Any], ...] = (
+    {
+        "name": "foundation",
+        "keys": ["versions_tf", "providers_tf", "locals_tf", "variables_tf", "resource_manifest"],
+        "description": "foundation files and canonical resource manifest",
+    },
+    {
+        "name": "main",
+        "keys": ["main_tf", "outputs_tf"],
+        "description": "main workload graph and outputs",
+    },
+    {
+        "name": "ops",
+        "keys": ["terragrunt_root_hcl", "terragrunt_dev_hcl", "terragrunt_prod_hcl", "readme_md", "test_files"],
+        "description": "terragrunt wrappers, README, and terraform tests",
+    },
+)
+
+
+def _extract_json_dict(text: str) -> dict[str, Any]:
+    matches = re.findall(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+    for match in sorted(matches, key=len, reverse=True):
+        try:
+            result = json.loads(match)
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = text[start : end + 1]
+        try:
+            result = json.loads(candidate)
+            if isinstance(result, dict):
+                return result
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    raise ValueError(f"Cannot extract JSON from Terraform agent response: {text[:300]}...")
+
+
+def _extract_hcl_block_names(hcl_text: str, block_type: str) -> list[str]:
+    if not hcl_text.strip():
+        return []
+    if block_type == "resource":
+        pattern = r'resource\s+"([^"]+)"\s+"([^"]+)"'
+        return [f"{resource_type}.{name}" for resource_type, name in re.findall(pattern, hcl_text)]
+    pattern = rf'{re.escape(block_type)}\s+"([^"]+)"'
+    return re.findall(pattern, hcl_text)
+
+
+def _build_terraform_stage_context(
+    stage_name: str,
+    completed_payloads: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    if not completed_payloads:
+        return {}
+
+    if stage_name == "main":
+        return {
+            "foundation": completed_payloads.get("foundation", {}),
+        }
+
+    if stage_name == "ops":
+        foundation = completed_payloads.get("foundation", {})
+        main = completed_payloads.get("main", {})
+        foundation_manifest = foundation.get("resource_manifest") if isinstance(foundation.get("resource_manifest"), dict) else {}
+        resources = foundation_manifest.get("resources", []) if isinstance(foundation_manifest, dict) else []
+        return {
+            "foundation_summary": {
+                "available_keys": sorted(foundation.keys()),
+                "variable_names": _extract_hcl_block_names(str(foundation.get("variables_tf", "")), "variable"),
+                "provider_blocks": _extract_hcl_block_names(str(foundation.get("providers_tf", "")), "provider"),
+                "resource_count": len(resources) if isinstance(resources, list) else 0,
+            },
+            "main_summary": {
+                "available_keys": sorted(main.keys()),
+                "resource_addresses": _extract_hcl_block_names(str(main.get("main_tf", "")), "resource")[:120],
+                "output_names": _extract_hcl_block_names(str(main.get("outputs_tf", "")), "output"),
+            },
+        }
+
+    return completed_payloads
+
+
+def _build_terraform_stage_prompt(
+    *,
+    spec_json: str,
+    approved_manifest_json: str,
+    stage_name: str,
+    description: str,
+    required_keys: list[str],
+    completed_payloads: dict[str, dict[str, Any]],
+) -> str:
+    language_instruction = human_language_instruction(extract_language_from_spec_json(spec_json))
+    completed_context = _build_terraform_stage_context(stage_name, completed_payloads)
+    completed_block = json.dumps(completed_context, ensure_ascii=False, indent=2) if completed_context else "{}"
+    required_keys_json = json.dumps(required_keys, ensure_ascii=False)
+    return (
+        f"Language rule: {language_instruction}\n\n"
+        "Execution mode: staged_bundle\n"
+        f"Current bundle: {stage_name}\n"
+        f"Bundle purpose: {description}\n\n"
+        "Do not ask clarifying questions. Return exactly one JSON object and nothing else.\n"
+        "In staged_bundle mode, do NOT return the full Terraform project envelope. Return only the keys listed in bundle_required_keys.\n"
+        "If a key is not listed in bundle_required_keys, omit it entirely.\n"
+        "Preserve the approved_resource_manifest as the source of truth. Use minimal reasonable assumptions and keep naming/tags/private-network rules intact.\n\n"
+        f"bundle_required_keys: {required_keys_json}\n\n"
+        "spec.json:\n"
+        f"```json\n{spec_json}\n```\n\n"
+        "approved_resource_manifest.json:\n"
+        f"```json\n{approved_manifest_json}\n```\n\n"
+        "completed_bundles_context.json:\n"
+        f"```json\n{completed_block}\n```\n"
+    )
+
+
+async def _invoke_terraform_stage(
+    *,
+    spec_json: str,
+    approved_manifest_json: str,
+    stage_name: str,
+    description: str,
+    required_keys: list[str],
+    completed_payloads: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    prompt = _build_terraform_stage_prompt(
+        spec_json=spec_json,
+        approved_manifest_json=approved_manifest_json,
+        stage_name=stage_name,
+        description=description,
+        required_keys=required_keys,
+        completed_payloads=completed_payloads,
+    )
+    raw, response_id = await agents.invoke_agent_raw(TERRAFORM_AGENT, prompt)
+    classification = agents.classify_response(raw)
+    logger.info(
+        "[parallel-terraform:%s] initial classify=%s (len=%d)",
+        stage_name,
+        classification,
+        len(raw),
+    )
+
+    language = extract_language_from_spec_json(spec_json)
+    auto_finalize_prompt = tr(
+        language,
+        f"不要再提問。你目前在 staged_bundle 模式，bundle={stage_name}。請只輸出一個 JSON 物件，且只能包含這些 keys: {', '.join(required_keys)}。不得加入前言、解釋、markdown 段落或其他額外文字。",
+        f"Do not ask any more questions. You are in staged_bundle mode for bundle={stage_name}. Return exactly one JSON object containing only these keys: {', '.join(required_keys)}. No prose, no explanation, and no extra markdown.",
+    )
+
+    nonfinal_turns = 0
+    while classification != "final" and nonfinal_turns < MAX_TERRAFORM_NONFINAL_RETRIES:
+        nonfinal_turns += 1
+        logger.warning(
+            "[parallel-terraform:%s] received non-final response; auto-finalize retry %d/%d. Raw excerpt=%.300s",
+            stage_name,
+            nonfinal_turns,
+            MAX_TERRAFORM_NONFINAL_RETRIES,
+            raw,
+        )
+        raw, response_id = await agents.invoke_agent_raw(
+            TERRAFORM_AGENT,
+            auto_finalize_prompt,
+            previous_response_id=response_id,
+        )
+        classification = agents.classify_response(raw)
+        logger.info(
+            "[parallel-terraform:%s] retry=%d classify=%s (len=%d)",
+            stage_name,
+            nonfinal_turns,
+            classification,
+            len(raw),
+        )
+
+    if classification != "final":
+        excerpt = re.sub(r"\s+", " ", raw).strip()[:300]
+        raise ValueError(
+            f"Terraform agent returned a non-final response for bundle={stage_name}: {excerpt}"
+        )
+
+    payload = _extract_json_dict(raw)
+    missing_keys = [key for key in required_keys if key not in payload]
+    if missing_keys:
+        raise ValueError(
+            f"Terraform staged bundle {stage_name} is missing required keys: {', '.join(missing_keys)}"
+        )
+    return payload
+
+
+async def _invoke_parallel_terraform_generation_single(
+    spec_json: str,
+    approved_manifest_json: str,
+) -> TerraformOutput:
+    prompt = agents.build_terraform_prompt(spec_json, approved_manifest_json)
+    raw, response_id = await agents.invoke_agent_raw(TERRAFORM_AGENT, prompt)
+    classification = agents.classify_response(raw)
+    logger.info(
+        "[parallel-terraform] initial classify=%s (len=%d)",
+        classification, len(raw),
+    )
+
+    language = extract_language_from_spec_json(spec_json)
+    auto_finalize_prompt = tr(
+        language,
+        "不要再提問。請依現有 spec.json 與 approved_resource_manifest.json 自行採用最小合理假設，並立即輸出最終結果。"
+        "整個回應必須只包含單一 JSON 物件（或 ```json 包裹的同一個 JSON 物件），不得加入任何前言、解釋、markdown 段落或額外文字。"
+        "若資訊缺漏或衝突，請在 readme_md 記錄假設，但仍必須完成完整 Terraform JSON envelope。",
+        "Do not ask any more questions. Use the existing spec.json and approved_resource_manifest.json, make the minimal reasonable assumptions, and return the final result now. "
+        "Your entire reply must be exactly one JSON object (or the same single JSON object wrapped in ```json), with no prose, no explanation, no markdown sections, and no extra text. "
+        "If information is missing or conflicting, record the assumptions in readme_md but still complete the full Terraform JSON envelope.",
+    )
+
+    nonfinal_turns = 0
+    while classification != "final" and nonfinal_turns < MAX_TERRAFORM_NONFINAL_RETRIES:
+        nonfinal_turns += 1
+        logger.warning(
+            "[parallel-terraform] received non-final response; auto-finalize retry %d/%d. Raw excerpt=%.300s",
+            nonfinal_turns,
+            MAX_TERRAFORM_NONFINAL_RETRIES,
+            raw,
+        )
+        raw, response_id = await agents.invoke_agent_raw(
+            TERRAFORM_AGENT,
+            auto_finalize_prompt,
+            previous_response_id=response_id,
+        )
+        classification = agents.classify_response(raw)
+        logger.info(
+            "[parallel-terraform] retry=%d classify=%s (len=%d)",
+            nonfinal_turns,
+            classification,
+            len(raw),
+        )
+
+    if classification != "final":
+        excerpt = re.sub(r"\s+", " ", raw).strip()[:300]
+        raise ValueError(
+            "Terraform agent returned a non-final response instead of the required JSON envelope: "
+            f"{excerpt}"
+        )
+
+    return agents.parse_terraform_output(raw)
+
+
+async def _invoke_parallel_terraform_generation_staged(
+    spec_json: str,
+    approved_manifest_json: str,
+) -> TerraformOutput:
+    completed_payloads: dict[str, dict[str, Any]] = {}
+    merged_payload: dict[str, Any] = {}
+
+    for bundle in _TERRAFORM_STAGE_BUNDLES:
+        stage_payload = await _invoke_terraform_stage(
+            spec_json=spec_json,
+            approved_manifest_json=approved_manifest_json,
+            stage_name=str(bundle["name"]),
+            description=str(bundle["description"]),
+            required_keys=list(bundle["keys"]),
+            completed_payloads=completed_payloads,
+        )
+        completed_payloads[str(bundle["name"])] = stage_payload
+        merged_payload.update(stage_payload)
+
+    return agents.parse_terraform_output(json.dumps(merged_payload, ensure_ascii=False))
 
 
 # ======================================================================
@@ -1165,55 +1436,12 @@ async def _invoke_parallel_terraform_generation(
     Terraform 在並行模式下不應進入使用者 multi-turn；若 agent 回追問或說明文字，
     會自動補一輪「請直接收斂為最終 JSON」的 follow-up，再嘗試解析。
     """
-    prompt = agents.build_terraform_prompt(spec_json, approved_manifest_json)
-    raw, response_id = await agents.invoke_agent_raw(TERRAFORM_AGENT, prompt)
-    classification = agents.classify_response(raw)
-    logger.info(
-        "[parallel-terraform] initial classify=%s (len=%d)",
-        classification, len(raw),
-    )
+    if TERRAFORM_GENERATION_MODE == "single":
+        logger.info("[parallel-terraform] generation_mode=single")
+        return await _invoke_parallel_terraform_generation_single(spec_json, approved_manifest_json)
 
-    language = extract_language_from_spec_json(spec_json)
-    auto_finalize_prompt = tr(
-        language,
-        "不要再提問。請依現有 spec.json 與 approved_resource_manifest.json 自行採用最小合理假設，並立即輸出最終結果。"
-        "整個回應必須只包含單一 JSON 物件（或 ```json 包裹的同一個 JSON 物件），不得加入任何前言、解釋、markdown 段落或額外文字。"
-        "若資訊缺漏或衝突，請在 readme_md 記錄假設，但仍必須完成完整 Terraform JSON envelope。",
-        "Do not ask any more questions. Use the existing spec.json and approved_resource_manifest.json, make the minimal reasonable assumptions, and return the final result now. "
-        "Your entire reply must be exactly one JSON object (or the same single JSON object wrapped in ```json), with no prose, no explanation, no markdown sections, and no extra text. "
-        "If information is missing or conflicting, record the assumptions in readme_md but still complete the full Terraform JSON envelope.",
-    )
-
-    nonfinal_turns = 0
-    while classification != "final" and nonfinal_turns < MAX_TERRAFORM_NONFINAL_RETRIES:
-        nonfinal_turns += 1
-        logger.warning(
-            "[parallel-terraform] received non-final response; auto-finalize retry %d/%d. Raw excerpt=%.300s",
-            nonfinal_turns,
-            MAX_TERRAFORM_NONFINAL_RETRIES,
-            raw,
-        )
-        raw, response_id = await agents.invoke_agent_raw(
-            TERRAFORM_AGENT,
-            auto_finalize_prompt,
-            previous_response_id=response_id,
-        )
-        classification = agents.classify_response(raw)
-        logger.info(
-            "[parallel-terraform] retry=%d classify=%s (len=%d)",
-            nonfinal_turns,
-            classification,
-            len(raw),
-        )
-
-    if classification != "final":
-        excerpt = re.sub(r"\s+", " ", raw).strip()[:300]
-        raise ValueError(
-            "Terraform agent returned a non-final response instead of the required JSON envelope: "
-            f"{excerpt}"
-        )
-
-    return agents.parse_terraform_output(raw)
+    logger.info("[parallel-terraform] generation_mode=staged")
+    return await _invoke_parallel_terraform_generation_staged(spec_json, approved_manifest_json)
 
 
 # ======================================================================
@@ -1300,6 +1528,7 @@ class DiagramGenerationExecutor(_MultiTurnAgentExecutor):
         output_dir = Path(ctx.get_state(KEY_OUTPUT_DIR))
         artifacts = [str(p) for p in write_diagram_output(output, output_dir)]
         ctx.set_state(KEY_DIAG_OUTPUT, output)
+        ctx.set_state(KEY_DIAG_RESPONSE_ID, self._response_id or "")
         ctx.set_state(
             KEY_APPROVED_RESOURCE_MANIFEST_JSON,
             output.approved_resource_manifest.to_json(),
@@ -1395,6 +1624,10 @@ async def _render_with_agent_regen(
         )
 
         try:
+            try:
+                previous_response_id = ctx.get_state(KEY_DIAG_RESPONSE_ID)
+            except KeyError:
+                previous_response_id = None
             repair_context_json = build_repair_context_json(
                 repair_kind="diagram_regen",
                 attempt=regen_attempt,
@@ -1425,7 +1658,12 @@ async def _render_with_agent_regen(
                 regen_attempt=regen_attempt,
                 repair_context_json=repair_context_json,
             )
-            raw, _ = await agents.invoke_agent_raw(DIAGRAM_AGENT, regen_prompt)
+            raw, rid = await agents.invoke_agent_raw(
+                DIAGRAM_AGENT,
+                regen_prompt,
+                previous_response_id=previous_response_id or None,
+            )
+            ctx.set_state(KEY_DIAG_RESPONSE_ID, rid)
             regenerated = agents.parse_diagram_output(raw)
             if not regenerated.diagram_py.strip():
                 raise ValueError("Diagram agent returned empty diagram_py during regen")
@@ -1596,7 +1834,7 @@ class DiagramReviewExecutor(Executor):
         await ctx.yield_output(tr(language, "🧭 [Step 6] 等待使用者確認架構圖\n", "🧭 [Step 6] Waiting for diagram approval\n"))
         await ctx.request_info(
             AgentQuestion(
-                agent_name=DIAGRAM_AGENT,
+                agent_name=DIAGRAM_REVIEW_AGENT,
                 question_text=(
                     tr(language, "請確認目前架構圖是否正確。\n", "Please confirm whether the current architecture diagram is correct.\n")
                     + tr(language, "- 可輸入 `approve` / `revise` / `reject`\n", "- You can enter `approve` / `revise` / `reject`\n")
@@ -1677,12 +1915,21 @@ class DiagramReviewExecutor(Executor):
                 arch_details: dict = (ctx.get_state(KEY_ARCH_DETAILS)) or {}
             except KeyError:
                 arch_details = {}
+            try:
+                previous_response_id = ctx.get_state(KEY_DIAG_RESPONSE_ID)
+            except KeyError:
+                previous_response_id = None
             arch_details_json = json.dumps(arch_details, ensure_ascii=False, indent=2)
             revised_prompt = (
                 f"{agents.build_diagram_prompt(spec.to_json(), arch_details_json)}\n\n"
                 f"{tr(language, '使用者修訂回饋', 'User feedback for revision')}:\n{feedback}"
             )
-            raw, _ = await agents.invoke_agent_raw(DIAGRAM_AGENT, revised_prompt)
+            raw, rid = await agents.invoke_agent_raw(
+                DIAGRAM_AGENT,
+                revised_prompt,
+                previous_response_id=previous_response_id or None,
+            )
+            ctx.set_state(KEY_DIAG_RESPONSE_ID, rid)
             revised = agents.parse_diagram_output(raw)
             output_dir = Path(ctx.get_state(KEY_OUTPUT_DIR))
             write_diagram_output(revised, output_dir)
@@ -1710,7 +1957,7 @@ class DiagramReviewExecutor(Executor):
         self._turn += 1
         await ctx.request_info(
             AgentQuestion(
-                agent_name=DIAGRAM_AGENT,
+                agent_name=DIAGRAM_REVIEW_AGENT,
                 question_text=tr(language, "已更新架構圖，請再次確認（approve/revise/reject）。", "The diagram has been updated. Please confirm again (approve/revise/reject)."),
                 turn=self._turn,
                 hint=tr(language, "可輸入修改建議文字", "You can also enter revision feedback in free text."),

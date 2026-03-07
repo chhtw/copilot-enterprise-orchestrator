@@ -37,12 +37,20 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_DIR = Path("./out")
 _COPILOT_SESSION_DIRNAME = ".copilot_sessions"
+_OUTPUT_DIR_OVERRIDE_FLAG = "ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE"
+
+
+def _allow_output_dir_override() -> bool:
+    raw = (os.getenv(_OUTPUT_DIR_OVERRIDE_FLAG, "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def get_configured_output_dir() -> Path:
-    """從環境變數取得目前的輸出目錄，未設定時回退到 ./out。"""
+    """回傳目前的輸出目錄；預設固定為 ./out，僅在顯式允許時接受 OUTPUT_DIR override。"""
     raw = os.getenv("OUTPUT_DIR", "").strip()
-    return Path(raw) if raw else DEFAULT_OUTPUT_DIR
+    if raw and _allow_output_dir_override():
+        return Path(raw)
+    return DEFAULT_OUTPUT_DIR
 
 
 def ensure_output_dir(output_dir: Optional[Path] = None) -> Path:
@@ -118,7 +126,6 @@ def write_terraform_output(
             written.append(p)
             logger.info("[IO] Wrote %s", p)
 
-    # Terragrunt files
     for tg_relpath, tg_content in [
         ("terragrunt.hcl", tf.terragrunt_root_hcl),
         ("envs/dev/terragrunt.hcl", tf.terragrunt_dev_hcl),

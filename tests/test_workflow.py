@@ -16,7 +16,7 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -33,6 +33,7 @@ from orchestrator_app.contracts import (
     PricingLineItem,
     PricingOutput,
     PricingStructureOutput,
+    ResourceManifest,
     Spec,
     StepResult,
     StepStatus,
@@ -54,6 +55,7 @@ from orchestrator_app.executors import _coerce_pricing_followup_answer, _normali
 from orchestrator_app.main import _build_initial_payload, build_agent, build_workflow
 from orchestrator_app import mock_agents
 from orchestrator_app.diagram_renderer import render_diagram_locally
+from orchestrator_app import executors
 
 
 # ======================================================================
@@ -212,12 +214,95 @@ class TestMockAgents:
         assert "[MOCK:en-US]" in prompt
 
 
+class TestDiagramReviewExecutor:
+    @pytest.mark.asyncio
+    async def test_review_prompt_uses_review_agent_name(self, tmp_output_dir):
+        executor = executors.DiagramReviewExecutor()
+        diag_output = DiagramOutput(
+            diagram_py='from diagrams import Diagram\nwith Diagram("demo"): pass',
+            diagram_image=b"png",
+            approved_resource_manifest=ResourceManifest(project_name="demo", resources=[]),
+            status=StepStatus.SUCCESS,
+        )
+        spec = Spec(project_name="demo", preferred_language="zh-TW")
+        state = {
+            executors.KEY_DIAG_OUTPUT: diag_output,
+            executors.KEY_SPEC: spec,
+        }
+        ctx = MagicMock()
+        ctx.get_state.side_effect = lambda key: state[key]
+        ctx.request_info = AsyncMock()
+        ctx.yield_output = AsyncMock()
+        ctx.send_message = AsyncMock()
+
+        await executor.handle([], ctx)
+
+        question = ctx.request_info.await_args.args[0]
+        assert question.agent_name == executors.DIAGRAM_REVIEW_AGENT
+
+    @pytest.mark.asyncio
+    async def test_revision_reuses_existing_diagram_session(self, tmp_output_dir, monkeypatch):
+        executor = executors.DiagramReviewExecutor()
+        executor._pending_messages = []
+        diag_output = DiagramOutput(
+            diagram_py='from diagrams import Diagram\nwith Diagram("demo"): pass',
+            diagram_image=b"png",
+            approved_resource_manifest=ResourceManifest(project_name="demo", resources=[]),
+            status=StepStatus.SUCCESS,
+        )
+        revised_output = DiagramOutput(
+            diagram_py='from diagrams import Diagram\nwith Diagram("demo2"): pass',
+            diagram_image=b"",
+            approved_resource_manifest=ResourceManifest(project_name="demo", resources=[]),
+            status=StepStatus.SUCCESS,
+        )
+        spec = Spec(project_name="demo", preferred_language="zh-TW")
+        state = {
+            executors.KEY_SPEC: spec,
+            executors.KEY_OUTPUT_DIR: str(tmp_output_dir),
+            executors.KEY_DIAG_OUTPUT: diag_output,
+            executors.KEY_DIAG_RESPONSE_ID: "diagram-session-1",
+            executors.KEY_ARCH_DETAILS: {},
+        }
+        ctx = MagicMock()
+        ctx.get_state.side_effect = lambda key: state[key]
+        ctx.set_state.side_effect = lambda key, value: state.__setitem__(key, value)
+        ctx.request_info = AsyncMock()
+        ctx.yield_output = AsyncMock()
+        ctx.send_message = AsyncMock()
+        monkeypatch.setattr(executors, "RENDER_DIAGRAM", False)
+
+        with (
+            patch.object(executors.agents, "build_diagram_prompt", return_value="base prompt"),
+            patch.object(executors.agents, "invoke_agent_raw", new=AsyncMock(return_value=("raw", "diagram-session-2"))) as invoke_mock,
+            patch.object(executors.agents, "parse_diagram_output", return_value=revised_output),
+            patch.object(executors, "write_diagram_output"),
+            patch.object(executors, "write_spec"),
+        ):
+            await executor.handle_response(
+                AgentQuestion(agent_name="Diagram-Review", question_text="q", turn=1, preferred_language="zh-TW"),
+                AgentAnswer(answer_text="請調整", command="revise"),
+                ctx,
+            )
+
+        assert invoke_mock.await_args.kwargs["previous_response_id"] == "diagram-session-1"
+        assert state[executors.KEY_DIAG_RESPONSE_ID] == "diagram-session-2"
+        followup_question = ctx.request_info.await_args.args[0]
+        assert followup_question.agent_name == executors.DIAGRAM_REVIEW_AGENT
+
+
 # ======================================================================
 # Test: I/O writers
 # ======================================================================
 class TestIOWriters:
-    def test_ensure_output_dir_uses_latest_env(self, tmp_output_dir, monkeypatch):
+    def test_ensure_output_dir_ignores_env_without_override_flag(self, tmp_output_dir, monkeypatch):
         monkeypatch.setenv("OUTPUT_DIR", str(tmp_output_dir))
+        monkeypatch.delenv("ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE", raising=False)
+        assert ensure_output_dir() == Path("./out")
+
+    def test_ensure_output_dir_uses_env_when_override_flag_enabled(self, tmp_output_dir, monkeypatch):
+        monkeypatch.setenv("OUTPUT_DIR", str(tmp_output_dir))
+        monkeypatch.setenv("ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE", "true")
         assert ensure_output_dir() == tmp_output_dir
 
     def test_write_spec(self, tmp_output_dir, sample_input_json):
@@ -426,8 +511,12 @@ class TestFullWorkflow:
         不會觸發 multi-turn，應一次完成所有步驟。
         """
         from agent_framework import Message
+        from orchestrator_app import executors
 
         os.environ["OUTPUT_DIR"] = str(tmp_output_dir)
+        os.environ["ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE"] = "true"
+        os.environ["TERRAFORM_AGENT_GENERATION_MODE"] = "single"
+        executors.TERRAFORM_GENERATION_MODE = "single"
 
         user_input = json.dumps(
             {
@@ -467,8 +556,12 @@ class TestFullWorkflow:
     async def test_workflow_with_natural_language(self, tmp_output_dir):
         """自然語言輸入的 workflow 測試。"""
         from agent_framework import Message
+        from orchestrator_app import executors
 
         os.environ["OUTPUT_DIR"] = str(tmp_output_dir)
+        os.environ["ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE"] = "true"
+        os.environ["TERRAFORM_AGENT_GENERATION_MODE"] = "single"
+        executors.TERRAFORM_GENERATION_MODE = "single"
 
         agent = build_agent()
         session = agent.create_session()
@@ -497,8 +590,12 @@ class TestFullWorkflow:
     async def test_workflow_diagram_requires_multiple_revisions_before_approve(self, tmp_output_dir):
         """模擬使用者先提兩次以上修改意見，最後才 approve。"""
         from agent_framework import Message
+        from orchestrator_app import executors
 
         os.environ["OUTPUT_DIR"] = str(tmp_output_dir)
+        os.environ["ORCHESTRATOR_ALLOW_OUTPUT_DIR_OVERRIDE"] = "true"
+        os.environ["TERRAFORM_AGENT_GENERATION_MODE"] = "single"
+        executors.TERRAFORM_GENERATION_MODE = "single"
 
         user_input = json.dumps(
             {
@@ -530,7 +627,7 @@ class TestFullWorkflow:
                     answers.append((rid, AgentAnswer(command="done")))
                     continue
 
-                if question.agent_name == "Azure-Diagram-Generation-Agent":
+                if question.agent_name == executors.DIAGRAM_REVIEW_AGENT:
                     diagram_review_turns += 1
                     if revise_count < 2:
                         revise_count += 1
