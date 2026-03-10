@@ -99,6 +99,8 @@ export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 cp .env.example .env
 ```
 
+`.env.example` 是最小可用樣板，README 內的環境變數表才是完整的 runtime 設定清單。
+
 最小可用設定：
 
 ```dotenv
@@ -182,12 +184,17 @@ HTTP 模式首個 request 可帶入：
 | 變數 | 預設值 | 說明 |
 |---|---|---|
 | AZURE_AI_PROJECT_ENDPOINT | 範例 endpoint | Foundry project endpoint |
+| AGENT_TIMEOUT | 120 | Foundry agent 通用 timeout；diagram/terraform 若未個別指定，會以此作為基礎值 |
+| AGENT_MAX_RETRIES | 2 | Foundry Responses API 呼叫失敗時的最大重試次數 |
+| AGENT_RETRY_DELAY | 5.0 | Foundry 重試前的基礎等待秒數 |
 | ARCHITECTURE_AGENT_NAME | Azure-Architecture-Clarification-Agent | 架構澄清 agent 名稱 |
 | TERRAFORM_AGENT_NAME | Azure-Terraform-Generation-Agent | Terraform agent 名稱 |
 | DIAGRAM_AGENT_NAME | Azure-Diagram-Generation-Agent | Diagram agent 名稱 |
 | DIAGRAM_REVIEW_AGENT_NAME | Diagram-Review | Step 6 review 對話顯示名稱 |
 | PRICING_STRUCTURE_AGENT_NAME | Azure-Pricing-Structure-Agent | Pricing structure agent 名稱 |
 | PRICING_BROWSER_AGENT_NAME | Azure-Pricing-Browser-Agent | Browser pricing agent 名稱 |
+| COST_STRUCTURE_AGENT_TIMEOUT | 300 | Pricing structure agent timeout |
+| COST_BROWSER_AGENT_TIMEOUT | 600 | Browser pricing agent timeout |
 
 ### 本地 Copilot Provider
 
@@ -259,6 +266,8 @@ python -m orchestrator_app.agent_sync push Azure-Pricing-Structure-Agent
 
 Runtime 一律以 prompts/ 內的 YAML 為本地 source of truth；hybrid 模式下 diagram 與 terraform prompt 也直接由本地 YAML 載入。
 
+`skills/terraform/` 內的文件會由 Terraform prompt builder 載入，提供 style guide、Azure Verified Modules 與測試慣例等補充上下文。
+
 ## 專案結構
 
 ```text
@@ -296,6 +305,8 @@ ccoe-Orchestrator/
 │   ├── retail_prices.py
 │   └── xlsx_builder.py
 └── tests/
+   ├── __init__.py
+   ├── conftest.py
     ├── test_agent_sync.py
     ├── test_copilot_local_agents.py
     ├── test_diagram_regen.py
@@ -366,9 +377,12 @@ source .venv/bin/activate
 export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 pytest -q
 pytest tests/test_workflow.py -v
+pytest tests/test_retail_prices.py -q
 pytest tests/test_hybrid_agents.py tests/test_copilot_local_agents.py -q
 pytest tests/test_diagram_regen.py tests/test_diagram_renderer_agent.py tests/test_agent_sync.py -q
 ```
+
+補充：`tests/conftest.py` 會自動把 `src/` 加入 `sys.path`，因此多數情況下直接執行 `pytest` 即可；README 仍保留 `PYTHONPATH` 設定，方便在 shell、CLI 與手動執行模組時保持一致。
 
 測試主要以 MOCK_MODE=true 為前提，不需連到 Foundry。現有測試重點覆蓋：
 

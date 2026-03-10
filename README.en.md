@@ -99,6 +99,8 @@ The project uses a src/ layout. If you are not running through VS Code launch se
 cp .env.example .env
 ```
 
+`.env.example` is a minimal local sample. The environment variable tables in this README are the authoritative list of runtime knobs.
+
 Minimal local setup:
 
 ```dotenv
@@ -182,12 +184,17 @@ The first HTTP request can include:
 | Variable | Default | Description |
 |---|---|---|
 | AZURE_AI_PROJECT_ENDPOINT | sample endpoint | Foundry project endpoint |
+| AGENT_TIMEOUT | 120 | Base timeout for Foundry agents; diagram/terraform fall back to this when their specific timeout is unset |
+| AGENT_MAX_RETRIES | 2 | Maximum retry attempts for Foundry Responses API calls |
+| AGENT_RETRY_DELAY | 5.0 | Base delay in seconds before Foundry retries |
 | ARCHITECTURE_AGENT_NAME | Azure-Architecture-Clarification-Agent | architecture clarification agent name |
 | TERRAFORM_AGENT_NAME | Azure-Terraform-Generation-Agent | Terraform agent name |
 | DIAGRAM_AGENT_NAME | Azure-Diagram-Generation-Agent | diagram agent name |
 | DIAGRAM_REVIEW_AGENT_NAME | Diagram-Review | display name used for Step 6 review prompts |
 | PRICING_STRUCTURE_AGENT_NAME | Azure-Pricing-Structure-Agent | pricing structure agent name |
 | PRICING_BROWSER_AGENT_NAME | Azure-Pricing-Browser-Agent | browser pricing agent name |
+| COST_STRUCTURE_AGENT_TIMEOUT | 300 | Pricing structure agent timeout |
+| COST_BROWSER_AGENT_TIMEOUT | 600 | Browser pricing agent timeout |
 
 ### Local Copilot Provider
 
@@ -259,6 +266,8 @@ The repository currently manages 5 prompt YAML files under prompts/:
 
 Runtime always treats the YAML files under prompts/ as the local source of truth. In hybrid mode, diagram and Terraform prompts are also loaded directly from local YAML.
 
+The files under `skills/terraform/` are loaded by the Terraform prompt builders to inject style-guide, Azure Verified Modules, and test guidance into generation and repair flows.
+
 ## Project Structure
 
 ```text
@@ -296,6 +305,8 @@ ccoe-Orchestrator/
 │   ├── retail_prices.py
 │   └── xlsx_builder.py
 └── tests/
+   ├── __init__.py
+   ├── conftest.py
     ├── test_agent_sync.py
     ├── test_copilot_local_agents.py
     ├── test_diagram_regen.py
@@ -366,9 +377,12 @@ source .venv/bin/activate
 export PYTHONPATH="$PWD/src:${PYTHONPATH:-}"
 pytest -q
 pytest tests/test_workflow.py -v
+pytest tests/test_retail_prices.py -q
 pytest tests/test_hybrid_agents.py tests/test_copilot_local_agents.py -q
 pytest tests/test_diagram_regen.py tests/test_diagram_renderer_agent.py tests/test_agent_sync.py -q
 ```
+
+Note: `tests/conftest.py` automatically adds `src/` to `sys.path`, so plain `pytest` usually works without extra setup. The `PYTHONPATH` export remains documented because it keeps shell usage, CLI runs, and direct module execution consistent.
 
 Most tests assume MOCK_MODE=true and do not require Foundry access. Current coverage focuses on:
 
